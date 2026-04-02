@@ -1440,3 +1440,124 @@ kernel void set_invalid_leaf_split_info(
         leaf_best_splits[larger_leaf_index].is_valid = 0;
     }
 }
+
+// ===========================================================================
+// Simple histogram kernel for GPUTreeLearner pattern.
+// Reads raw bin data per feature group, accumulates into float histogram.
+// Each thread processes one data point across all feature groups.
+// ===========================================================================
+
+kernel void histogram_simple(
+    const device float*   gradients        [[buffer(0)]],
+    const device float*   hessians         [[buffer(1)]],
+    const device uchar*   bin_data         [[buffer(2)]],  // row-major: [num_data * num_groups]
+    const device uint*    group_bin_offsets [[buffer(3)]],  // [num_groups+1] cumulative bin offsets
+    const device int*     data_indices     [[buffer(4)]],  // leaf data indices
+    device float*         hist_output      [[buffer(5)]],  // [total_bins * 2] grad/hess pairs
+    constant uint&        num_data_in_leaf [[buffer(6)]],
+    constant uint&        num_groups       [[buffer(7)]],
+    constant uint&        total_bins       [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= num_data_in_leaf) return;
+
+    const int data_idx = data_indices[tid];
+    const float g = gradients[data_idx];
+    const float h = hessians[data_idx];
+
+    const device uchar* row = bin_data + uint(data_idx) * num_groups;
+    for (uint grp = 0; grp < num_groups; ++grp) {
+        const uint bin = uint(row[grp]);
+        const uint global_bin = group_bin_offsets[grp] + bin;
+        // Atomic float add via CAS loop
+        {
+            device atomic_uint* addr = (device atomic_uint*)&hist_output[global_bin * 2];
+            uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+            uint next;
+            do {
+                next = as_type<uint>(as_type<float>(expected) + g);
+            } while (!atomic_compare_exchange_weak_explicit(addr, &expected, next,
+                        memory_order_relaxed, memory_order_relaxed));
+        }
+        {
+            device atomic_uint* addr = (device atomic_uint*)&hist_output[global_bin * 2 + 1];
+            uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+            uint next;
+            do {
+                next = as_type<uint>(as_type<float>(expected) + h);
+            } while (!atomic_compare_exchange_weak_explicit(addr, &expected, next,
+                        memory_order_relaxed, memory_order_relaxed));
+        }
+    }
+}
+
+// ===========================================================================
+// Optimized histogram kernel with threadgroup-local accumulation.
+// One threadgroup per feature group. Threads iterate over data in the leaf.
+// ===========================================================================
+
+kernel void histogram_grouped(
+    const device float*   gradients        [[buffer(0)]],
+    const device float*   hessians         [[buffer(1)]],
+    const device uchar*   bin_data         [[buffer(2)]],
+    const device uint*    group_bin_offsets [[buffer(3)]],
+    const device int*     data_indices     [[buffer(4)]],
+    device float*         hist_output      [[buffer(5)]],
+    constant uint&        num_data_in_leaf [[buffer(6)]],
+    constant uint&        num_groups       [[buffer(7)]],
+    constant uint&        total_bins       [[buffer(8)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]],
+    uint gid  [[threadgroup_position_in_grid]])
+{
+    const uint grp = gid;
+    if (grp >= num_groups) return;
+
+    const uint bin_start = group_bin_offsets[grp];
+    const uint bin_end = group_bin_offsets[grp + 1];
+    const uint nbins = bin_end - bin_start;
+
+    // Threadgroup-local histogram
+    threadgroup atomic_uint local_hist[512 * 2]; // max 512 bins per group
+
+    // Zero local histogram
+    for (uint i = tid; i < nbins * 2; i += tgs) {
+        atomic_store_explicit(&local_hist[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Accumulate
+    for (uint i = tid; i < num_data_in_leaf; i += tgs) {
+        const int data_idx = data_indices[i];
+        const float g = gradients[data_idx];
+        const float h = hessians[data_idx];
+        const uint bin = uint(bin_data[uint(data_idx) * num_groups + grp]);
+
+        // CAS-loop atomic float add
+        {
+            threadgroup atomic_uint* addr = &local_hist[bin * 2];
+            uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+            uint next;
+            do {
+                next = as_type<uint>(as_type<float>(expected) + g);
+            } while (!atomic_compare_exchange_weak_explicit(addr, &expected, next,
+                        memory_order_relaxed, memory_order_relaxed));
+        }
+        {
+            threadgroup atomic_uint* addr = &local_hist[bin * 2 + 1];
+            uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+            uint next;
+            do {
+                next = as_type<uint>(as_type<float>(expected) + h);
+            } while (!atomic_compare_exchange_weak_explicit(addr, &expected, next,
+                        memory_order_relaxed, memory_order_relaxed));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write local histogram to global output (no contention — one group per threadgroup)
+    for (uint i = tid; i < nbins * 2; i += tgs) {
+        hist_output[(bin_start + i / 2) * 2 + (i % 2)] =
+            as_type<float>(atomic_load_explicit(&local_hist[i], memory_order_relaxed));
+    }
+}

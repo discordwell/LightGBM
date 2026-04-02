@@ -85,6 +85,12 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   std::vector<char> feature_masks_;
   int max_num_bin_;
   std::string kernel_name_;
+
+  // GPU histogram data
+  void* bin_data_buffer_ = nullptr;     // Packed row-major bin data
+  void* group_offsets_buffer_ = nullptr;// Group bin boundary offsets
+  bool bin_data_packed_ = false;
+  std::vector<uint32_t> group_bin_offsets_;
 };
 
 }  // namespace LightGBM

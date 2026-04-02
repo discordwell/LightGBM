@@ -161,12 +161,178 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
 
 void MetalSingleGPUTreeLearner::ConstructHistograms(
     const std::vector<int8_t>& is_feature_used, bool use_subtract) {
-  // For now, use CPU histogram construction (proven correct).
-  // GPU acceleration will be enabled once kernel bin encoding is verified.
-  // The GPU kernel dispatch infrastructure is ready — just need to align
-  // the bin indexing between InitRowData (Feature4 packing) and
-  // SerialTreeLearner's split evaluation.
-  SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+  // Build histogram for the smaller leaf using Metal GPU.
+  hist_t* ptr_smaller_leaf_hist_data =
+      smaller_leaf_histogram_array_[0].RawData() - kHistOffset;
+
+  const data_size_t num_data_in_leaf = smaller_leaf_splits_->num_data_in_leaf();
+  const data_size_t* data_indices = smaller_leaf_splits_->data_indices();
+  const int num_groups = train_data_->num_feature_groups();
+  const int total_bins = train_data_->NumTotalBin();
+
+  // Pack bin data: row-major [num_data × num_groups] uint8
+  // Uses unified memory — CPU writes, GPU reads, zero copy cost.
+  if (!bin_data_packed_) {
+    const size_t pack_size = static_cast<size_t>(num_data_) * num_groups;
+    @autoreleasepool {
+      id<MTLDevice> dev = (__bridge id<MTLDevice>)metal_device_;
+      id<MTLBuffer> buf = [dev newBufferWithLength:pack_size
+                                           options:MTLResourceStorageModeShared];
+      bin_data_buffer_ = (__bridge_retained void*)buf;
+    }
+    uint8_t* dst = reinterpret_cast<uint8_t*>(
+        [(__bridge id<MTLBuffer>)bin_data_buffer_ contents]);
+
+    // Pack using feature group iterators (same bin values as CPU histogram)
+    for (int g = 0; g < num_groups; ++g) {
+      if (train_data_->IsMultiGroup(g)) {
+        // Multi-valued groups: skip for GPU, will be handled by CPU below
+        for (data_size_t row = 0; row < num_data_; ++row) {
+          dst[static_cast<size_t>(row) * num_groups + g] = 0;
+        }
+        continue;
+      }
+      BinIterator* iter = train_data_->FeatureGroupIterator(g);
+      iter->Reset(0);
+      for (data_size_t row = 0; row < num_data_; ++row) {
+        dst[static_cast<size_t>(row) * num_groups + g] =
+            static_cast<uint8_t>(iter->RawGet(row));
+      }
+    }
+    bin_data_packed_ = true;
+
+    // Build group bin offset array
+    group_bin_offsets_.resize(num_groups + 1);
+    group_bin_offsets_[0] = 0;
+    for (int g = 0; g < num_groups; ++g) {
+      group_bin_offsets_[g + 1] =
+          static_cast<uint32_t>(train_data_->GroupBinBoundary(g + 1));
+    }
+    @autoreleasepool {
+      id<MTLDevice> dev = (__bridge id<MTLDevice>)metal_device_;
+      id<MTLBuffer> buf = [dev newBufferWithBytes:group_bin_offsets_.data()
+                                          length:group_bin_offsets_.size() * sizeof(uint32_t)
+                                         options:MTLResourceStorageModeShared];
+      group_offsets_buffer_ = (__bridge_retained void*)buf;
+    }
+
+    // Create histogram_simple pipeline
+    @autoreleasepool {
+      id<MTLLibrary> lib = (__bridge id<MTLLibrary>)metal_library_;
+      id<MTLFunction> func = [lib newFunctionWithName:@"histogram_grouped"];
+      METAL_CHECK(func != nil, "histogram_simple kernel not found");
+      NSError* error = nil;
+      id<MTLComputePipelineState> pso =
+          [(__bridge id<MTLDevice>)metal_device_
+              newComputePipelineStateWithFunction:func error:&error];
+      METAL_CHECK(pso != nil, "Failed to create histogram_simple pipeline");
+      histogram_pipeline_ = (__bridge_retained void*)pso;
+    }
+
+    // Float histogram buffer
+    @autoreleasepool {
+      id<MTLDevice> dev = (__bridge id<MTLDevice>)metal_device_;
+      id<MTLBuffer> buf = [dev newBufferWithLength:total_bins * 2 * sizeof(float)
+                                           options:MTLResourceStorageModeShared];
+      histogram_output_buffer_ = (__bridge_retained void*)buf;
+    }
+  }
+
+  // --- GPU histogram dispatch ---
+  @autoreleasepool {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal_queue_;
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+    id<MTLComputePipelineState> pso =
+        (__bridge id<MTLComputePipelineState>)histogram_pipeline_;
+    [enc setComputePipelineState:pso];
+
+    // Zero the float histogram
+    float* hist_float = reinterpret_cast<float*>(
+        [(__bridge id<MTLBuffer>)histogram_output_buffer_ contents]);
+    std::memset(hist_float, 0, total_bins * 2 * sizeof(float));
+
+    // Set buffers
+    [enc setBuffer:(__bridge id<MTLBuffer>)gradients_buffer_ offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_buffer_ offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:3];
+
+    // Data indices — need to pass them in a Metal buffer
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)metal_device_;
+    id<MTLBuffer> idx_buf;
+    if (num_data_in_leaf == num_data_) {
+      // Root node: sequential indices
+      idx_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
+      int* idx_ptr = reinterpret_cast<int*>([idx_buf contents]);
+      for (data_size_t i = 0; i < num_data_; ++i) idx_ptr[i] = i;
+    } else {
+      idx_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
+      std::memcpy([idx_buf contents], data_indices,
+                  num_data_in_leaf * sizeof(data_size_t));
+    }
+    [enc setBuffer:idx_buf offset:0 atIndex:4];
+
+    [enc setBuffer:(__bridge id<MTLBuffer>)histogram_output_buffer_ offset:0 atIndex:5];
+
+    uint32_t num_data_arg = static_cast<uint32_t>(num_data_in_leaf);
+    uint32_t num_groups_arg = static_cast<uint32_t>(num_groups);
+    uint32_t total_bins_arg = static_cast<uint32_t>(total_bins);
+    [enc setBytes:&num_data_arg length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&num_groups_arg length:sizeof(uint32_t) atIndex:7];
+    [enc setBytes:&total_bins_arg length:sizeof(uint32_t) atIndex:8];
+
+    // Dispatch
+    // One threadgroup per feature group, threads iterate over data
+    NSUInteger tg_size = std::min(256u, (uint32_t)[pso maxTotalThreadsPerThreadgroup]);
+    NSUInteger num_tg = static_cast<NSUInteger>(num_groups);
+    [enc dispatchThreadgroups:MTLSizeMake(num_tg, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    [enc endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+
+    // Convert float histogram → double (hist_t) into the output array
+    for (int g = 0; g < num_groups; ++g) {
+      if (train_data_->IsMultiGroup(g)) continue;
+      const int start = train_data_->GroupBinBoundary(g);
+      const int end = train_data_->GroupBinBoundary(g + 1);
+      hist_t* dst = ptr_smaller_leaf_hist_data + start * 2;
+      const float* src = hist_float + start * 2;
+      for (int b = start; b < end; ++b) {
+        dst[(b - start) * 2] = static_cast<hist_t>(src[(b) * 2 - start * 2]);
+        dst[(b - start) * 2 + 1] = static_cast<hist_t>(src[(b) * 2 + 1 - start * 2]);
+      }
+    }
+  }
+
+  // Handle sparse feature groups on CPU
+  {
+    std::vector<int8_t> is_sparse_used(num_features_, 0);
+    for (int f = 0; f < num_features_; ++f) {
+      if (!is_feature_used[f]) continue;
+      if (train_data_->IsMultiGroup(train_data_->Feature2Group(f))) {
+        is_sparse_used[f] = 1;
+      }
+    }
+    train_data_->ConstructHistograms<false, 0>(
+        is_sparse_used, data_indices, num_data_in_leaf,
+        gradients_, hessians_,
+        ordered_gradients_.data(), ordered_hessians_.data(),
+        share_state_.get(), ptr_smaller_leaf_hist_data);
+  }
+
+  // Handle larger leaf (subtraction or explicit)
+  if (larger_leaf_histogram_array_ != nullptr && !use_subtract) {
+    hist_t* ptr_larger = larger_leaf_histogram_array_[0].RawData() - kHistOffset;
+    // Use CPU for the larger leaf for now (TODO: GPU acceleration)
+    train_data_->ConstructHistograms<false, 0>(
+        is_feature_used, larger_leaf_splits_->data_indices(),
+        larger_leaf_splits_->num_data_in_leaf(),
+        gradients_, hessians_,
+        ordered_gradients_.data(), ordered_hessians_.data(),
+        share_state_.get(), ptr_larger);
+  }
 }
 
 // ============================================================================
