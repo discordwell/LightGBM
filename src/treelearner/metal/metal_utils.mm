@@ -51,7 +51,7 @@ static void InitQueue() {
   });
 }
 
-static NSString* FindMetallibPath() {
+static NSString* FindMetallibPathInternal() {
   Dl_info info;
   if (dladdr(reinterpret_cast<const void*>(&MetalDevice::GetDevice), &info) && info.dli_fname) {
     NSString* dylib = [NSString stringWithUTF8String:info.dli_fname];
@@ -78,7 +78,7 @@ static void InitLibrary() {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
     InitDevice();
-    NSString* path = FindMetallibPath();
+    NSString* path = FindMetallibPathInternal();
     METAL_CHECK(path != nil, "Cannot locate lib_lightgbm.metallib");
     NSError* error = nil;
     NSURL* url = [NSURL fileURLWithPath:path];
@@ -100,6 +100,10 @@ void* MetalDevice::GetDevice() {
 void* MetalDevice::GetQueue() {
   InitQueue();
   return (__bridge void*)g_queue;
+}
+
+void* MetalDevice::FindMetallibPath() {
+  return (__bridge_retained void*)FindMetallibPathInternal();
 }
 
 void* MetalDevice::GetLibrary() {

@@ -48,6 +48,9 @@ class MetalDevice {
    */
   static void* GetPipeline(const char* function_name);
 
+  /*! \brief Find the path to lib_lightgbm.metallib. Returns NSString* as void*. */
+  static void* FindMetallibPath();
+
  private:
   MetalDevice() = delete;
 };

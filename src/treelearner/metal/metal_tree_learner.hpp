@@ -10,15 +10,22 @@
 
 #ifdef LGBM_USE_METAL
 
-#include "metal_leaf_splits.hpp"
-#include "metal_histogram_constructor.hpp"
-#include "metal_best_split_finder.hpp"
-
 #include <memory>
 #include <vector>
 
 namespace LightGBM {
 
+/*!
+ * \brief Metal GPU-accelerated tree learner for Apple Silicon.
+ *
+ * Follows the GPUTreeLearner (OpenCL) pattern: overrides only histogram
+ * construction to dispatch a Metal compute kernel. Split finding, data
+ * partitioning, and all other logic use SerialTreeLearner's CPU code.
+ *
+ * Unlike the previous v1 approach (which had a custom training loop),
+ * this design reuses the proven CPU infrastructure and only accelerates
+ * the bottleneck (histogram construction).
+ */
 class MetalSingleGPUTreeLearner : public SerialTreeLearner {
  public:
   explicit MetalSingleGPUTreeLearner(const Config* config);
@@ -26,29 +33,58 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void Init(const Dataset* train_data, bool is_constant_hessian) override;
   Tree* Train(const score_t* gradients, const score_t* hessians, bool is_first_tree) override;
   void ResetTrainingData(const Dataset* train_data, bool is_constant_hessian) override;
-  void SetBaggingData(const Dataset* subset, const data_size_t* used_indices, data_size_t num_data) override;
 
  protected:
   void BeforeTrain() override;
+  void ConstructHistograms(const std::vector<int8_t>& is_feature_used, bool use_subtract) override;
 
-  std::unique_ptr<MetalLeafSplits> smaller_leaf_splits_;
-  std::unique_ptr<MetalLeafSplits> larger_leaf_splits_;
-  std::unique_ptr<MetalHistogramConstructor> histogram_constructor_;
-  std::unique_ptr<MetalBestSplitFinder> best_split_finder_;
+ private:
+  /*! \brief 4-byte feature tuple used by GPU kernel (matches OpenCL GPUTreeLearner) */
+  struct Feature4 {
+    uint8_t s[4];
+  };
 
-  std::vector<int> leaf_best_split_feature_;
-  std::vector<uint32_t> leaf_best_split_threshold_;
-  std::vector<uint8_t> leaf_best_split_default_left_;
-  std::vector<data_size_t> leaf_num_data_;
-  std::vector<data_size_t> leaf_data_start_;
-  std::vector<double> leaf_sum_gradients_;
-  std::vector<double> leaf_sum_hessians_;
+  typedef float gpu_hist_t;
 
-  int smaller_leaf_index_;
-  int larger_leaf_index_;
-  int best_leaf_index_;
-  bool has_categorical_feature_;
-  int num_threads_;
+  /*! \brief Initialize Metal device, load metallib, create pipeline */
+  void InitMetal();
+
+  /*! \brief Pack feature data into Feature4 format for GPU */
+  void AllocateMetalBuffers();
+
+  /*! \brief Build GPU histogram for given leaf data */
+  void BuildMetalHistogram(data_size_t num_data, const data_size_t* data_indices);
+
+  /*! \brief Wait for GPU and copy histogram results */
+  void WaitAndGetHistograms(hist_t* histograms);
+
+  // Metal objects (opaque pointers to Objective-C types)
+  void* metal_device_ = nullptr;
+  void* metal_queue_ = nullptr;
+  void* metal_library_ = nullptr;
+  void* histogram_pipeline_ = nullptr;
+  void* pending_command_buffer_ = nullptr;
+
+  // Metal buffers
+  void* features_buffer_ = nullptr;    // Feature4 packed data
+  void* gradients_buffer_ = nullptr;   // Cached gradient copy
+  void* hessians_buffer_ = nullptr;    // Cached hessian copy
+  void* data_indices_buffer_ = nullptr;
+  void* histogram_output_buffer_ = nullptr;  // float histogram output
+
+  // Feature layout
+  int num_feature_groups_;
+  int num_dense_feature_groups_;
+  int num_dense_feature4_;
+  int dword_features_;
+  int device_bin_size_;
+  size_t hist_bin_entry_sz_;
+  std::vector<int> dense_feature_group_map_;
+  std::vector<int> sparse_feature_group_map_;
+  std::vector<int> device_bin_mults_;
+  std::vector<char> feature_masks_;
+  int max_num_bin_;
+  std::string kernel_name_;
 };
 
 }  // namespace LightGBM
