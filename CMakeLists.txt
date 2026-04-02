@@ -7,6 +7,7 @@ option(USE_SWIG "Enable SWIG to generate Java API" OFF)
 option(USE_TIMETAG "Set to ON to output time costs" OFF)
 option(USE_CUDA "Enable CUDA-accelerated training " OFF)
 option(USE_ROCM "Enable ROCm-accelerated training " OFF)
+option(LGBM_USE_METAL "Enable Metal-accelerated training (Apple Silicon)" OFF)
 option(USE_DEBUG "Set to ON for Debug mode" OFF)
 option(USE_SANITIZER "Use sanitizer flags" OFF)
 set(
@@ -292,6 +293,37 @@ if(USE_ROCM)
     add_definitions(-DUSE_ROCM)
 endif()
 
+if(LGBM_USE_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "LGBM_USE_METAL requires macOS with Apple Silicon")
+    endif()
+    if(USE_GPU OR USE_CUDA OR USE_ROCM)
+        message(FATAL_ERROR "LGBM_USE_METAL cannot be combined with USE_GPU, USE_CUDA, or USE_ROCM")
+    endif()
+
+    enable_language(OBJCXX)
+    find_library(METAL_FRAMEWORK Metal REQUIRED)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+
+    add_definitions(-DLGBM_USE_METAL)
+
+    # Compile Metal kernels to metallib (fails if Metal compiler unavailable, like nvcc for CUDA)
+    set(METAL_KERNEL_SOURCE "${PROJECT_SOURCE_DIR}/src/treelearner/metal/kernels/metal_kernels.metal")
+    set(METALLIB_OUTPUT "${CMAKE_BINARY_DIR}/lib_lightgbm.metallib")
+    add_custom_command(
+        OUTPUT "${CMAKE_BINARY_DIR}/metal_kernels.air"
+        COMMAND xcrun -sdk macosx metal -c "${METAL_KERNEL_SOURCE}" -o "${CMAKE_BINARY_DIR}/metal_kernels.air"
+        DEPENDS "${METAL_KERNEL_SOURCE}"
+        COMMENT "Compiling Metal kernels")
+    add_custom_command(
+        OUTPUT "${METALLIB_OUTPUT}"
+        COMMAND xcrun -sdk macosx metallib "${CMAKE_BINARY_DIR}/metal_kernels.air" -o "${METALLIB_OUTPUT}"
+        DEPENDS "${CMAKE_BINARY_DIR}/metal_kernels.air"
+        COMMENT "Linking Metal kernels into lib_lightgbm.metallib")
+    add_custom_target(metallib ALL DEPENDS "${METALLIB_OUTPUT}")
+    install(FILES "${METALLIB_OUTPUT}" DESTINATION lib)
+endif()
+
 include(CheckCXXSourceCompiles)
 check_cxx_source_compiles("
 #include <xmmintrin.h>
@@ -438,6 +470,22 @@ set(
       src/treelearner/voting_parallel_tree_learner.cpp
       src/utils/openmp_wrapper.cpp
 )
+
+if(LGBM_USE_METAL)
+    set(LGBM_METAL_SOURCES
+        src/treelearner/metal/metal_tree_learner.mm
+        src/treelearner/metal/metal_histogram_constructor.mm
+        src/treelearner/metal/metal_best_split_finder.mm
+        src/treelearner/metal/metal_leaf_splits.mm
+        src/treelearner/metal/metal_utils.mm
+    )
+    list(APPEND LGBM_SOURCES ${LGBM_METAL_SOURCES})
+    set_source_files_properties(${LGBM_METAL_SOURCES} PROPERTIES
+        LANGUAGE OBJCXX
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+endif()
+
 set(
     LGBM_CUDA_SOURCES
       src/boosting/cuda/cuda_score_updater.cpp
@@ -611,6 +659,11 @@ endif()
 if(USE_ROCM)
   find_package(rccl)
   target_link_libraries(lightgbm_objs PUBLIC ${RCCL_LIBRARY})
+endif()
+
+if(LGBM_USE_METAL)
+  add_dependencies(lightgbm_objs metallib)
+  target_link_libraries(lightgbm_objs PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
 endif()
 
 if(__INTEGRATE_OPENCL)
