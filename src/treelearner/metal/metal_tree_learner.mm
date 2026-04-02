@@ -102,6 +102,10 @@ void MetalSingleGPUTreeLearner::Init(const Dataset* train_data,
 // ---------------------------------------------------------------------------
 
 void MetalSingleGPUTreeLearner::BeforeTrain() {
+  // For now, delegate to the CPU base class.
+  SerialTreeLearner::BeforeTrain();
+  return;
+#if 0  // Metal-specific BeforeTrain (under development)
   fprintf(stderr, "[Metal] BeforeTrain: start\n");
 
   data_partition_->Init();
@@ -140,6 +144,7 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
 
   smaller_leaf_index_ = 0;
   larger_leaf_index_ = -1;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +153,10 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
 
 Tree* MetalSingleGPUTreeLearner::Train(const score_t* gradients,
                                        const score_t* hessians,
-                                       bool /*is_first_tree*/) {
+                                       bool is_first_tree) {
+  // TEMPORARY: use CPU training path to verify integration
+  return SerialTreeLearner::Train(gradients, hessians, is_first_tree);
+#if 0  // Metal training loop (under development)
   gradients_ = gradients;
   hessians_ = hessians;
   BeforeTrain();
@@ -280,6 +288,12 @@ Tree* MetalSingleGPUTreeLearner::Train(const score_t* gradients,
           train_data_->FeatureBinMapper(inner_feature_index)->missing_type());
     }
 
+    fprintf(stderr, "[Metal] Split applied: best_leaf=%d right_leaf=%d feature=%d threshold=%u default_left=%d gain=%.2f left_g=%.4f left_h=%.4f right_g=%.4f right_h=%.4f\n",
+            best_leaf_index_, right_leaf_index, inner_feature_index,
+            best_split.threshold, best_split.default_left ? 1 : 0,
+            best_split.gain, best_split.left_sum_gradient, best_split.left_sum_hessian,
+            best_split.right_sum_gradient, best_split.right_sum_hessian);
+
     // --- Update per-leaf tracking ---
     leaf_best_split_feature_[best_leaf_index_] = best_split.feature;
     leaf_best_split_threshold_[best_leaf_index_] = best_split.threshold;
@@ -291,6 +305,10 @@ Tree* MetalSingleGPUTreeLearner::Train(const score_t* gradients,
         data_partition_->leaf_count(best_leaf_index_);
     leaf_num_data_[right_leaf_index] =
         data_partition_->leaf_count(right_leaf_index);
+    fprintf(stderr, "[Metal] After split: leaf[%d]=%d rows, leaf[%d]=%d rows, split_gain=%.4f\n",
+            best_leaf_index_, leaf_num_data_[best_leaf_index_],
+            right_leaf_index, leaf_num_data_[right_leaf_index],
+            best_split.gain);
     leaf_data_start_[best_leaf_index_] =
         data_partition_->leaf_begin(best_leaf_index_);
     leaf_data_start_[right_leaf_index] =
@@ -347,6 +365,7 @@ Tree* MetalSingleGPUTreeLearner::Train(const score_t* gradients,
   }
 
   return tree.release();
+#endif
 }
 
 // ---------------------------------------------------------------------------

@@ -169,6 +169,9 @@ void MetalHistogramConstructor::Init(
       static_cast<size_t>(num_leaves_);
   hist_buf_.Resize(hist_size);
   std::memset(hist_buf_.data(), 0, hist_size * sizeof(hist_t));
+  // Separate float buffer for GPU output (kernel writes float, host uses double)
+  gpu_hist_float_.Resize(hist_size);
+  std::memset(gpu_hist_float_.data(), 0, hist_size * sizeof(float));
   fprintf(stderr, "[Metal] HistogramConstructor::Init: hist_buf allocated (%zu entries)\n", hist_size);
 
   feature_num_bins_buf_.Resize(feature_num_bins_.size());
@@ -274,10 +277,14 @@ void MetalHistogramConstructor::ConstructHistogramForLeaf(
               offset:0
              atIndex:4];
 
-  // Buffer 5: histogram output — offset to the smaller leaf's region
+  // Buffer 5: GPU float histogram output — offset to the smaller leaf's region.
+  // The kernel writes float; we convert to hist_t (double) after completion.
   const int64_t smaller_hist_offset = smaller_leaf->hist_offset;
-  [encoder setBuffer:(__bridge id<MTLBuffer>)hist_buf_.GetMTLBuffer()
-              offset:static_cast<NSUInteger>(smaller_hist_offset) * sizeof(hist_t)
+  // Zero the GPU output region for this leaf
+  std::memset(gpu_hist_float_.data() + smaller_hist_offset,
+              0, num_total_bin_ * 2 * sizeof(float));
+  [encoder setBuffer:(__bridge id<MTLBuffer>)gpu_hist_float_.GetMTLBuffer()
+              offset:static_cast<NSUInteger>(smaller_hist_offset) * sizeof(float)
              atIndex:5];
 
   // Buffer 6: constants struct
@@ -322,6 +329,33 @@ void MetalHistogramConstructor::ConstructHistogramForLeaf(
             [[[cmdBuf error] localizedDescription] UTF8String]);
   }
   fprintf(stderr, "[Metal] ConstructHistogram: GPU done\n");
+
+  // Convert GPU float histogram → host double histogram.
+  {
+    const float* src = gpu_hist_float_.data() + smaller_hist_offset;
+    hist_t* dst = hist_buf_.data() + smaller_hist_offset;
+    const size_t n = static_cast<size_t>(num_total_bin_) * 2;
+    for (size_t j = 0; j < n; ++j) {
+      dst[j] = static_cast<hist_t>(src[j]);
+    }
+  }
+
+  // Debug: dump histogram for first feature
+  {
+    hist_t* h = hist_buf_.data() + smaller_hist_offset;
+    double gsum = 0, hsum = 0;
+    int nonzero = 0;
+    uint32_t nfbins = feature_num_bins_[0];
+    for (uint32_t b = 0; b < nfbins; ++b) {
+      double g = h[feature_hist_offsets_[0] * 2 + b * 2];
+      double hs = h[feature_hist_offsets_[0] * 2 + b * 2 + 1];
+      gsum += g;
+      hsum += hs;
+      if (g != 0 || hs != 0) nonzero++;
+    }
+    fprintf(stderr, "[Metal] Histogram feature 0: %d/%d non-zero bins, gsum=%.4f hsum=%.4f\n",
+            nonzero, nfbins, gsum, hsum);
+  }
 
   // Fix histogram for features with most_freq_bin != 0.
   // The GPU kernel skips the most-frequent-bin slot; we reconstruct it

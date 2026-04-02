@@ -369,7 +369,7 @@ static void FindBestSplitForTask(
                           parent_gain;
       if (gain > best_gain) {
         best_gain = gain;
-        best_bin = b + 1 - mfb_offset;
+        best_bin = b - mfb_offset;
         best_left_grad = prefix_grad;
         best_left_hess = prefix_hess;
         best_left_cnt = prefix_cnt;
@@ -409,7 +409,7 @@ static void FindBestSplitForTask(
                           parent_gain;
       if (gain > best_gain) {
         best_gain = gain;
-        best_bin = static_cast<uint32_t>(b) + 1 - mfb_offset;
+        best_bin = static_cast<uint32_t>(b) - mfb_offset;
         best_left_grad = right_grad;
         best_left_hess = right_hess;
         best_left_cnt = right_cnt;

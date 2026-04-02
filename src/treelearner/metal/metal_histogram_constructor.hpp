@@ -80,7 +80,8 @@ class MetalHistogramConstructor {
   std::vector<int> need_fix_histogram_features_;
   std::vector<uint32_t> need_fix_histogram_features_num_bin_aligned_;
 
-  MetalBuffer<hist_t> hist_buf_;
+  MetalBuffer<hist_t> hist_buf_;          // double-precision host histogram
+  MetalBuffer<float> gpu_hist_float_;    // float GPU output (kernel writes float, not double)
   MetalBuffer<uint32_t> feature_num_bins_buf_;
   MetalBuffer<uint32_t> feature_hist_offsets_buf_;
   MetalBuffer<uint32_t> feature_most_freq_bins_buf_;
