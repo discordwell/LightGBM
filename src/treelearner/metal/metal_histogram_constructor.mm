@@ -98,8 +98,7 @@ void MetalHistogramConstructor::InitFeatureMetaInfo(
 void MetalHistogramConstructor::InitRowData(
     const Dataset* train_data,
     TrainingShareStates* share_state) {
-  // Determine the maximum number of bins across all features to choose the
-  // appropriate bin data width.
+  fprintf(stderr, "[Metal] InitRowData: start, num_features=%d num_data=%d\n", num_features_, num_data_);
   uint32_t max_bin = 0;
   for (int f = 0; f < num_features_; ++f) {
     const uint32_t nb = feature_num_bins_[f];
@@ -127,11 +126,13 @@ void MetalHistogramConstructor::InitRowData(
   // Fill row data from the dataset's feature iterators.
   // Each BinIterator provides bin values per data point for a feature.
   // The returned pointers are owned by the Dataset; do not delete them.
+  fprintf(stderr, "[Metal] InitRowData: allocating %zu bytes, bit_type=%d\n", total_bytes, row_data_bit_type_);
   std::vector<BinIterator*> iterators(num_features_);
   for (int f = 0; f < num_features_; ++f) {
     iterators[f] = train_data->FeatureIterator(f);
     iterators[f]->Reset(0);
   }
+  fprintf(stderr, "[Metal] InitRowData: iterators ready, packing rows...\n");
 
   if (row_data_bit_type_ == 8) {
     #pragma omp parallel for num_threads(num_threads_) schedule(static)
@@ -151,6 +152,7 @@ void MetalHistogramConstructor::InitRowData(
       }
     }
   }
+  fprintf(stderr, "[Metal] InitRowData: done\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -160,14 +162,15 @@ void MetalHistogramConstructor::InitRowData(
 void MetalHistogramConstructor::Init(
     const Dataset* train_data,
     TrainingShareStates* share_state) {
-  // Allocate histogram buffer: 2 doubles (grad, hess) per bin, per leaf.
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: start, bins=%d leaves=%d features=%d\n",
+          num_total_bin_, num_leaves_, num_features_);
   const size_t hist_size =
       static_cast<size_t>(num_total_bin_) * 2 *
       static_cast<size_t>(num_leaves_);
   hist_buf_.Resize(hist_size);
   std::memset(hist_buf_.data(), 0, hist_size * sizeof(hist_t));
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: hist_buf allocated (%zu entries)\n", hist_size);
 
-  // Copy feature metadata into Metal buffers for GPU access.
   feature_num_bins_buf_.Resize(feature_num_bins_.size());
   std::memcpy(feature_num_bins_buf_.data(), feature_num_bins_.data(),
               feature_num_bins_.size() * sizeof(uint32_t));
@@ -180,11 +183,15 @@ void MetalHistogramConstructor::Init(
   std::memcpy(feature_most_freq_bins_buf_.data(),
               feature_most_freq_bins_.data(),
               feature_most_freq_bins_.size() * sizeof(uint32_t));
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: metadata copied, calling InitRowData\n");
 
   InitRowData(train_data, share_state);
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: InitRowData done\n");
 
   histogram_pso_ = MetalDevice::GetPipeline("histogram_dense");
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: histogram_dense pipeline=%p\n", histogram_pso_);
   subtract_pso_ = MetalDevice::GetPipeline("histogram_subtract");
+  fprintf(stderr, "[Metal] HistogramConstructor::Init: done\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,17 +218,22 @@ void MetalHistogramConstructor::ConstructHistogramForLeaf(
     data_size_t num_data_in_larger_leaf,
     double sum_hessians_in_smaller_leaf,
     double sum_hessians_in_larger_leaf) {
+  fprintf(stderr, "[Metal] ConstructHistogram: smaller=%d(%d rows) larger=%d(%d rows)\n",
+          smaller_leaf->leaf_index, num_data_in_smaller_leaf,
+          larger_leaf ? larger_leaf->leaf_index : -1, num_data_in_larger_leaf);
   // Skip if both leaves fail minimum constraints.
   if ((num_data_in_smaller_leaf <= min_data_in_leaf_ ||
        sum_hessians_in_smaller_leaf <= min_sum_hessian_in_leaf_) &&
       (num_data_in_larger_leaf <= min_data_in_leaf_ ||
        sum_hessians_in_larger_leaf <= min_sum_hessian_in_leaf_)) {
+    fprintf(stderr, "[Metal] ConstructHistogram: skipped (min constraints)\n");
     return;
   }
 
   id<MTLCommandQueue> queue =
       (__bridge id<MTLCommandQueue>)MetalDevice::GetQueue();
   id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+  fprintf(stderr, "[Metal] ConstructHistogram: command buffer created\n");
 
   id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
   id<MTLComputePipelineState> pso =
@@ -300,8 +312,16 @@ void MetalHistogramConstructor::ConstructHistogramForLeaf(
           threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
 
   [encoder endEncoding];
+  fprintf(stderr, "[Metal] ConstructHistogram: dispatched %lu groups × %lu threads, committing...\n",
+          (unsigned long)num_threadgroups, (unsigned long)threadgroup_size);
   [cmdBuf commit];
+  fprintf(stderr, "[Metal] ConstructHistogram: committed, waiting...\n");
   [cmdBuf waitUntilCompleted];
+  if ([cmdBuf status] == MTLCommandBufferStatusError) {
+    fprintf(stderr, "[Metal] ConstructHistogram: GPU ERROR: %s\n",
+            [[[cmdBuf error] localizedDescription] UTF8String]);
+  }
+  fprintf(stderr, "[Metal] ConstructHistogram: GPU done\n");
 
   // Fix histogram for features with most_freq_bin != 0.
   // The GPU kernel skips the most-frequent-bin slot; we reconstruct it

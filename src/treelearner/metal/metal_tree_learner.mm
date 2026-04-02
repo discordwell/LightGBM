@@ -102,11 +102,10 @@ void MetalSingleGPUTreeLearner::Init(const Dataset* train_data,
 // ---------------------------------------------------------------------------
 
 void MetalSingleGPUTreeLearner::BeforeTrain() {
-  // Gradients and hessians live in host memory; on Apple Silicon unified
-  // memory they are already GPU-accessible. No copy required.
+  fprintf(stderr, "[Metal] BeforeTrain: start\n");
 
-  // Initialise the CPU data partition.
   data_partition_->Init();
+  fprintf(stderr, "[Metal] BeforeTrain: data_partition init done\n");
 
   const data_size_t root_num_data = data_partition_->leaf_count(0);
 
@@ -131,7 +130,10 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
   larger_leaf_splits_->InitValues();
 
   // Prepare histogram and split finder for the iteration.
+  fprintf(stderr, "[Metal] BeforeTrain: root leaf init done, grad_sum=%.4f hess_sum=%.4f num_data=%d\n",
+          root_struct->sum_of_gradients, root_struct->sum_of_hessians, root_num_data);
   histogram_constructor_->BeforeTrain(gradients_, hessians_);
+  fprintf(stderr, "[Metal] BeforeTrain: histogram constructor ready\n");
 
   col_sampler_.ResetByTree();
   best_split_finder_->BeforeTrain(col_sampler_.is_feature_used_bytree());
@@ -161,8 +163,10 @@ Tree* MetalSingleGPUTreeLearner::Train(const score_t* gradients,
   const MetalLeafSplitsStruct* root = smaller_leaf_splits_->GetStruct();
   tree->SetLeafOutput(0, root->leaf_value);
 
+  fprintf(stderr, "[Metal] Train: entering split loop, num_leaves=%d\n", config_->num_leaves);
   // Main split loop.
   for (int i = 0; i < config_->num_leaves - 1; ++i) {
+    fprintf(stderr, "[Metal] Train: split %d, smaller=%d larger=%d\n", i, smaller_leaf_index_, larger_leaf_index_);
     // --- Histogram construction ---
     const data_size_t num_data_smaller = leaf_num_data_[smaller_leaf_index_];
     const data_size_t num_data_larger =

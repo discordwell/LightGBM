@@ -296,95 +296,74 @@ inline float threadgroup_reduce_sum(float val,
 // Each thread iterates over a portion of the data rows in this leaf.
 // ===========================================================================
 
+// Simple histogram kernel matching host buffer layout:
+//   buffer(0): float* gradients          [num_data]
+//   buffer(1): float* hessians           [num_data]
+//   buffer(2): uchar* row_bin_data       [num_data * num_features] row-major
+//   buffer(3): uint*  feature_hist_offsets [num_features+1] cumulative bin offsets
+//   buffer(4): uint*  feature_mfb         [num_features] most-frequent-bin per feature
+//   buffer(5): float* hist_output         [num_total_bin * 2] interleaved grad/hess
+//   buffer(6): HistogramParams struct     {num_data, num_features, num_total_bin, bit_type}
+//   buffer(7): int    data_offset         start index into data partition
+//   buffer(8): uint*  feature_num_bins    [num_features]
+// Dispatch: one threadgroup per feature, threads iterate over rows.
+struct HistogramParams {
+    uint num_data;
+    uint num_features;
+    uint num_total_bin;
+    uint bit_type;
+};
+
 kernel void histogram_dense(
-    // Leaf information
-    const device LeafSplitsStruct*  leaf_splits       [[buffer(0)]],
-    // Gradient/hessian arrays (one per data row)
-    const device float*             gradients          [[buffer(1)]],
-    const device float*             hessians           [[buffer(2)]],
-    // Bin data: row-major, layout [num_data * num_features] or
-    // column-partitioned as [partition_col_start * num_data ...]
-    const device uchar*             bin_data           [[buffer(3)]],
-    // Per-column histogram offset within the feature partition
-    const device uint*              column_hist_offsets       [[buffer(4)]],
-    // Per-partition cumulative histogram offset
-    const device uint*              column_hist_offsets_full  [[buffer(5)]],
-    // Feature partition column index boundaries
-    const device int*               feature_partition_column_index_offsets [[buffer(6)]],
-    // Total number of data rows
-    const device uint&              num_data           [[buffer(7)]],
-    // Data indices for this leaf
-    const device int*               data_indices       [[buffer(8)]],
-    // Output: global histogram buffer [num_total_bins * 2] floats (grad, hess interleaved)
-    device atomic_uint*             global_histogram   [[buffer(9)]],
-    // Threadgroup position
-    uint2 group_id      [[threadgroup_position_in_grid]],
-    uint2 tid_in_group  [[thread_position_in_threadgroup]],
-    uint2 tg_size       [[threads_per_threadgroup]])
+    const device float*       gradients        [[buffer(0)]],
+    const device float*       hessians         [[buffer(1)]],
+    const device uchar*       row_bin_data     [[buffer(2)]],
+    const device uint*        feature_hist_offsets [[buffer(3)]],
+    const device uint*        feature_mfb      [[buffer(4)]],
+    device float*             hist_output      [[buffer(5)]],
+    constant HistogramParams& params           [[buffer(6)]],
+    constant int&             data_offset      [[buffer(7)]],
+    const device uint*        feature_num_bins [[buffer(8)]],
+    uint tid       [[thread_position_in_threadgroup]],
+    uint tg_size   [[threads_per_threadgroup]],
+    uint group_id  [[threadgroup_position_in_grid]])
 {
-    // group_id.x = feature partition index
-    // group_id.y = data block index
-    const uint partition_idx = group_id.x;
-    const int partition_column_start = feature_partition_column_index_offsets[partition_idx];
-    const int partition_column_end   = feature_partition_column_index_offsets[partition_idx + 1];
-    const int num_columns_in_partition = partition_column_end - partition_column_start;
+    const uint feature = group_id;
+    if (feature >= params.num_features) return;
 
-    const uint partition_hist_start = column_hist_offsets_full[partition_idx];
-    const uint partition_hist_end   = column_hist_offsets_full[partition_idx + 1];
-    const uint num_hist_items       = (partition_hist_end - partition_hist_start) << 1;
+    const uint hist_start = feature_hist_offsets[feature];
+    const uint nbins = feature_num_bins[feature];
+    const uint mfb = feature_mfb[feature];
 
-    const uint num_data_in_leaf = leaf_splits->num_data_in_leaf;
-    const uint data_offset      = leaf_splits->data_indices_offset;
-
-    // Threadgroup local histogram (grad/hess pairs as atomic uints for CAS)
+    // Threadgroup-local histogram (grad + hess per bin)
     threadgroup atomic_uint local_hist[MAX_SHARED_HIST_ENTRIES * 2];
 
-    const uint thread_idx = tid_in_group.x + tid_in_group.y * tg_size.x;
-    const uint num_threads = tg_size.x * tg_size.y;
-
-    // Zero the local histogram
-    for (uint i = thread_idx; i < num_hist_items; i += num_threads) {
+    // Zero bins for this feature
+    for (uint i = tid; i < nbins * 2; i += tg_size) {
         atomic_store_explicit(&local_hist[i], 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Compute data range for this block
-    const uint dim_y = tg_size.y;  // threads in y-dimension
-    const uint total_y_blocks = dim_y;  // effectively gridDim.y * blockDim.y collapsed
-    const uint num_data_per_thread = (num_data_in_leaf + total_y_blocks - 1) / total_y_blocks;
-    const uint block_start = group_id.y * dim_y * num_data_per_thread;
-    const uint block_num_data = min(num_data_in_leaf - min(block_start, num_data_in_leaf),
-                                    num_data_per_thread * dim_y);
+    // Accumulate gradients/hessians into local histogram
+    const uint num_rows = params.num_data;
+    const uint num_feat = params.num_features;
+    for (uint r = tid; r < num_rows; r += tg_size) {
+        const uint row_idx = r;  // data_offset is handled by host via partition indices
+        const uint bin = uint(row_bin_data[row_idx * num_feat + feature]);
+        if (bin == mfb) continue;  // skip most-frequent-bin (fixed on CPU later)
 
-    const uint column_index = tid_in_group.x + uint(partition_column_start);
-    const device uchar* data_ptr = bin_data + uint(partition_column_start) * num_data;
-
-    if (tid_in_group.x < uint(num_columns_in_partition)) {
-        const uint col_hist_offset = column_hist_offsets[column_index] << 1;
-
-        for (uint inner = tid_in_group.y; inner < block_num_data; inner += dim_y) {
-            const uint row_in_leaf = block_start + inner;
-            if (row_in_leaf >= num_data_in_leaf) break;
-
-            const int data_index = data_indices[data_offset + row_in_leaf];
-            const float grad = gradients[data_index];
-            const float hess = hessians[data_index];
-            const uint bin = uint(data_ptr[uint(data_index) * uint(num_columns_in_partition) + tid_in_group.x]);
-            const uint pos = col_hist_offset + (bin << 1);
-
-            atomic_add_float(&local_hist[pos], grad);
-            atomic_add_float(&local_hist[pos + 1], hess);
-        }
+        const float g = gradients[row_idx];
+        const float h = hessians[row_idx];
+        atomic_add_float(&local_hist[bin * 2], g);
+        atomic_add_float(&local_hist[bin * 2 + 1], h);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Flush local histogram to global histogram using device atomics
-    const uint global_hist_offset = (leaf_splits->hist_offset + partition_hist_start) << 1;
-    for (uint i = thread_idx; i < num_hist_items; i += num_threads) {
+    // Write local histogram to global output (no inter-threadgroup contention
+    // since each threadgroup handles a different feature)
+    for (uint i = tid; i < nbins * 2; i += tg_size) {
         float val = as_type<float>(atomic_load_explicit(&local_hist[i], memory_order_relaxed));
-        if (val != 0.0f) {
-            atomic_add_float_device(&global_histogram[global_hist_offset + i], val);
-        }
+        hist_output[(hist_start + i / 2) * 2 + (i % 2)] = val;
     }
 }
 

@@ -35,10 +35,10 @@ static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipelines;
 static void InitDevice() {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
+    fprintf(stderr, "[Metal] InitDevice: creating device...\n");
     g_device = MTLCreateSystemDefaultDevice();
     METAL_CHECK(g_device != nil, "No Metal device found");
-    Log::Info("[Metal] Using device: %s",
-              [[g_device name] UTF8String]);
+    fprintf(stderr, "[Metal] InitDevice: %s\n", [[g_device name] UTF8String]);
   });
 }
 
