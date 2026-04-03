@@ -16,10 +16,11 @@
 
 #include <vector>
 
-#include "../leaf_splits.hpp"
 #include "../split_info.hpp"
 
 namespace LightGBM {
+
+struct MetalLeafSplitsStruct;
 
 struct MetalSplitFindTask {
   int32_t inner_feature_index;
@@ -63,11 +64,11 @@ class MetalBestSplitFinder {
 
   void FindBestSplitsForLeaf(
       const hist_t* smaller_leaf_hist,
-      const LeafSplits* smaller_leaf_splits,
+      const MetalLeafSplitsStruct* smaller_leaf_splits,
       int smaller_leaf_index,
       const std::vector<int8_t>& smaller_node_used_features,
       const hist_t* larger_leaf_hist,
-      const LeafSplits* larger_leaf_splits,
+      const MetalLeafSplitsStruct* larger_leaf_splits,
       int larger_leaf_index,
       const std::vector<int8_t>* larger_node_used_features);
 
@@ -89,7 +90,7 @@ class MetalBestSplitFinder {
   void InitFeatureMetaInfo(const Dataset* train_data);
   void InitTasks();
   void UploadHistogram(const hist_t* src_hist, size_t slot);
-  void DispatchSplitKernel(const LeafSplits* leaf_splits,
+  void DispatchSplitKernel(const MetalLeafSplitsStruct* leaf_splits,
                            int leaf_index,
                            size_t hist_slot,
                            const std::vector<int8_t>& node_feature_mask);

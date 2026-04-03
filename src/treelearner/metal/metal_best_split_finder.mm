@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 
 #include "metal_best_split_finder.hpp"
+#include "metal_leaf_splits.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -199,24 +200,26 @@ void MetalBestSplitFinder::UploadHistogram(const hist_t* src_hist, size_t slot) 
 }
 
 void MetalBestSplitFinder::DispatchSplitKernel(
-    const LeafSplits* leaf_splits,
+    const MetalLeafSplitsStruct* leaf_splits,
     int leaf_index,
     size_t hist_slot,
     const std::vector<int8_t>& node_feature_mask) {
   if (leaf_index < 0 || leaf_splits == nullptr ||
-      leaf_splits->num_data_in_leaf() <= min_data_in_leaf_ ||
-      leaf_splits->sum_hessians() <= min_sum_hessian_in_leaf_) {
+      leaf_splits->num_data_in_leaf <= min_data_in_leaf_ ||
+      leaf_splits->sum_of_hessians <= min_sum_hessian_in_leaf_) {
     ClearLeafBest(leaf_index);
     return;
   }
 
-  const float total_grad = static_cast<float>(leaf_splits->sum_gradients());
-  const float total_hess = static_cast<float>(leaf_splits->sum_hessians());
+  const float total_grad =
+      static_cast<float>(leaf_splits->sum_of_gradients);
+  const float total_hess =
+      static_cast<float>(leaf_splits->sum_of_hessians);
   const uint32_t total_count =
-      static_cast<uint32_t>(leaf_splits->num_data_in_leaf());
+      static_cast<uint32_t>(leaf_splits->num_data_in_leaf);
   const float parent_gain = static_cast<float>(
-      CalcLeafGain(leaf_splits->sum_gradients(), leaf_splits->sum_hessians(),
-                   lambda_l1_, lambda_l2_));
+      CalcLeafGain(leaf_splits->sum_of_gradients,
+                   leaf_splits->sum_of_hessians, lambda_l1_, lambda_l2_));
   const float lambda_l1 = static_cast<float>(lambda_l1_);
   const float lambda_l2 = static_cast<float>(lambda_l2_);
   const float min_gain_to_split = static_cast<float>(min_gain_to_split_);
@@ -296,11 +299,11 @@ void MetalBestSplitFinder::DispatchSplitKernel(
 
 void MetalBestSplitFinder::FindBestSplitsForLeaf(
     const hist_t* smaller_leaf_hist,
-    const LeafSplits* smaller_leaf_splits,
+    const MetalLeafSplitsStruct* smaller_leaf_splits,
     int smaller_leaf_index,
     const std::vector<int8_t>& smaller_node_used_features,
     const hist_t* larger_leaf_hist,
-    const LeafSplits* larger_leaf_splits,
+    const MetalLeafSplitsStruct* larger_leaf_splits,
     int larger_leaf_index,
     const std::vector<int8_t>* larger_node_used_features) {
   if (smaller_leaf_hist != nullptr && smaller_leaf_splits != nullptr) {

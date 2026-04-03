@@ -11,6 +11,9 @@
 
 #include "metal_leaf_splits.hpp"
 
+#include "../data_partition.hpp"
+#include "../leaf_splits.hpp"
+
 #include <cmath>
 
 namespace LightGBM {
@@ -19,12 +22,26 @@ namespace LightGBM {
 //  Construction / destruction
 // ---------------------------------------------------------------------------
 
-MetalLeafSplits::MetalLeafSplits(data_size_t num_data)
-    : leaf_struct_(1), num_data_(num_data) {
-  InitValues();
+MetalLeafSplits::MetalLeafSplits(data_size_t num_data, size_t num_slots)
+    : leaf_struct_(std::max<size_t>(static_cast<size_t>(1), num_slots)),
+      num_data_(num_data),
+      num_slots_(std::max<size_t>(static_cast<size_t>(1), num_slots)) {
+  Reset();
 }
 
 MetalLeafSplits::~MetalLeafSplits() {}
+
+void MetalLeafSplits::ResizeSlots(size_t num_slots) {
+  num_slots_ = std::max<size_t>(static_cast<size_t>(1), num_slots);
+  leaf_struct_.Resize(num_slots_);
+  Reset();
+}
+
+void MetalLeafSplits::Reset() {
+  for (size_t slot = 0; slot < num_slots_; ++slot) {
+    InitValues(slot);
+  }
+}
 
 // ---------------------------------------------------------------------------
 //  Leaf math helpers (mirror CUDALeafSplits device functions, CPU-side)
@@ -58,8 +75,33 @@ double MetalLeafSplits::GetLeafGain(double sum_gradients,
 //  InitValues — mark the leaf as empty / invalid
 // ---------------------------------------------------------------------------
 
+void MetalLeafSplits::SetLeafState(size_t slot,
+                                   int leaf_index,
+                                   double sum_gradients,
+                                   double sum_hessians,
+                                   data_size_t num_data_in_leaf,
+                                   double leaf_value,
+                                   data_size_t data_indices_offset,
+                                   int64_t hist_offset) {
+  CHECK_LT(slot, num_slots_);
+  MetalLeafSplitsStruct* s = GetStruct(slot);
+  s->leaf_index = leaf_index;
+  s->sum_of_gradients = sum_gradients;
+  s->sum_of_hessians = sum_hessians;
+  s->num_data_in_leaf = num_data_in_leaf;
+  s->gain = GetLeafGain(sum_gradients, sum_hessians, 0.0, 0.0);
+  s->leaf_value = leaf_value;
+  s->data_indices_offset = data_indices_offset;
+  s->hist_offset = hist_offset;
+}
+
 void MetalLeafSplits::InitValues() {
-  MetalLeafSplitsStruct* s = leaf_struct_.data();
+  InitValues(0);
+}
+
+void MetalLeafSplits::InitValues(size_t slot) {
+  CHECK_LT(slot, num_slots_);
+  MetalLeafSplitsStruct* s = GetStruct(slot);
   s->leaf_index = -1;
   s->sum_of_gradients = 0.0;
   s->sum_of_hessians = 0.0;
@@ -101,16 +143,30 @@ void MetalLeafSplits::Init(const score_t* gradients,
     }
   }
 
-  MetalLeafSplitsStruct* s = leaf_struct_.data();
-  s->leaf_index = 0;
-  s->sum_of_gradients = sum_grad;
-  s->sum_of_hessians = sum_hess;
-  s->num_data_in_leaf = num_data;
-  s->gain = GetLeafGain(sum_grad, sum_hess, lambda_l1, lambda_l2);
-  s->leaf_value = CalculateSplittedLeafOutput(sum_grad, sum_hess,
-                                              lambda_l1, lambda_l2);
-  s->data_indices_offset = 0;
-  s->hist_offset = 0;
+  SetLeafState(0, 0, sum_grad, sum_hess, num_data,
+               CalculateSplittedLeafOutput(sum_grad, sum_hess, lambda_l1,
+                                           lambda_l2),
+               0, 0);
+  GetStruct(0)->gain = GetLeafGain(sum_grad, sum_hess, lambda_l1, lambda_l2);
+}
+
+void MetalLeafSplits::SyncLeaf(size_t slot,
+                               const LeafSplits* leaf_splits,
+                               const DataPartition* data_partition,
+                               int64_t hist_offset) {
+  if (leaf_splits == nullptr || data_partition == nullptr ||
+      leaf_splits->leaf_index() < 0) {
+    InitValues(slot);
+    return;
+  }
+  const int leaf_index = leaf_splits->leaf_index();
+  SetLeafState(slot, leaf_index,
+               leaf_splits->sum_gradients(),
+               leaf_splits->sum_hessians(),
+               leaf_splits->num_data_in_leaf(),
+               leaf_splits->weight(),
+               data_partition->leaf_begin(leaf_index),
+               hist_offset);
 }
 
 }  // namespace LightGBM

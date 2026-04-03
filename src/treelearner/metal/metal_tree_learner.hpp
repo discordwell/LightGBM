@@ -10,6 +10,7 @@
 
 #ifdef LGBM_USE_METAL
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -17,6 +18,8 @@
 namespace LightGBM {
 
 class MetalBestSplitFinder;
+class MetalLeafSplits;
+struct MetalLeafSplitsStruct;
 
 /*!
  * \brief Metal GPU-accelerated tree learner for Apple Silicon.
@@ -63,6 +66,11 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
 
   /*! \brief Allocate Metal buffers for gradient/hessian/indices */
   void AllocateMetalBuffers();
+  void SyncMetalActiveLeafState();
+  double GetMetalParentOutput(const Tree* tree,
+                              const MetalLeafSplitsStruct* leaf_state) const;
+  const MetalLeafSplitsStruct* GetActiveMetalLeafState(size_t slot) const;
+  const MetalLeafSplitsStruct* FindActiveMetalLeafState(int leaf_index) const;
 
   // Metal objects (opaque pointers to Objective-C types)
   void* metal_device_ = nullptr;
@@ -101,6 +109,7 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   std::vector<uint32_t> group_bin_offsets_;
   std::vector<uint32_t> dense_group_map_;
   std::unique_ptr<MetalBestSplitFinder> best_split_finder_;
+  std::unique_ptr<MetalLeafSplits> metal_leaf_splits_;
 
   // Feature layout
   int num_feature_groups_;

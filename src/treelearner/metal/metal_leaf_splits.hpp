@@ -15,6 +15,9 @@
 
 namespace LightGBM {
 
+class DataPartition;
+class LeafSplits;
+
 /*!
  * \brief POD struct that lives in a MetalBuffer (StorageModeShared) so both
  *        CPU and GPU can read/write it without explicit copies.
@@ -45,8 +48,11 @@ struct MetalLeafSplitsStruct {
  */
 class MetalLeafSplits {
  public:
-  explicit MetalLeafSplits(data_size_t num_data);
+  explicit MetalLeafSplits(data_size_t num_data, size_t num_slots = 1);
   ~MetalLeafSplits();
+
+  void ResizeSlots(size_t num_slots);
+  void Reset();
 
   /*!
    * \brief Initialise for the root leaf.  Sums all gradients and hessians,
@@ -58,9 +64,20 @@ class MetalLeafSplits {
 
   /*! \brief Reset the struct to represent an empty (invalid) leaf. */
   void InitValues();
+  void InitValues(size_t slot);
+
+  void SyncLeaf(size_t slot, const LeafSplits* leaf_splits,
+                const DataPartition* data_partition, int64_t hist_offset = 0);
 
   MetalLeafSplitsStruct* GetStruct() { return leaf_struct_.data(); }
   const MetalLeafSplitsStruct* GetStruct() const { return leaf_struct_.data(); }
+  MetalLeafSplitsStruct* GetStruct(size_t slot) {
+    return leaf_struct_.data() + slot;
+  }
+  const MetalLeafSplitsStruct* GetStruct(size_t slot) const {
+    return leaf_struct_.data() + slot;
+  }
+  size_t num_slots() const { return num_slots_; }
 
   /*! \brief Underlying Metal buffer for binding to compute kernels. */
   void* GetMTLBuffer() { return leaf_struct_.GetMTLBuffer(); }
@@ -72,9 +89,14 @@ class MetalLeafSplits {
                                             double l1, double l2);
   static double GetLeafGain(double sum_gradients, double sum_hessians,
                             double l1, double l2);
+  void SetLeafState(size_t slot, int leaf_index, double sum_gradients,
+                    double sum_hessians, data_size_t num_data_in_leaf,
+                    double leaf_value, data_size_t data_indices_offset,
+                    int64_t hist_offset);
 
   MetalBuffer<MetalLeafSplitsStruct> leaf_struct_;
   data_size_t num_data_;
+  size_t num_slots_;
 };
 
 }  // namespace LightGBM
