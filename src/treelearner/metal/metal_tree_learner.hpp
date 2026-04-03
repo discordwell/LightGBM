@@ -10,21 +10,29 @@
 
 #ifdef LGBM_USE_METAL
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace LightGBM {
 
+class MetalBestSplitFinder;
+
 /*!
  * \brief Metal GPU-accelerated tree learner for Apple Silicon.
  *
- * Follows the GPUTreeLearner (OpenCL) pattern: overrides only histogram
- * construction to dispatch a Metal compute kernel. Split finding, data
- * partitioning, and all other logic use SerialTreeLearner's CPU code.
+ * Current v1 scope is performance-first and intentionally narrow: dense
+ * numerical data only, serial GBDT only, and max_bin <= 256. Histogram
+ * construction is dispatched to Metal; the serial CPU loop still owns tree
+ * mutation and data partitioning, and remains the default split-search path
+ * until the experimental Metal split finder is fast enough to help end-to-end
+ * wall time.
  *
- * Unlike the previous v1 approach (which had a custom training loop),
- * this design reuses the proven CPU infrastructure and only accelerates
- * the bottleneck (histogram construction).
+ * Two kernel strategies, auto-selected based on feature count:
+ *  - Row-parallel (wide datasets): one thread per row, all features per thread.
+ *    Reads each gradient once instead of N_features times.
+ *  - Column-grouped (narrow datasets): one threadgroup per feature group,
+ *    fast threadgroup-local histogram with CAS-loop atomics.
  */
 class MetalSingleGPUTreeLearner : public SerialTreeLearner {
  public:
@@ -33,64 +41,69 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void Init(const Dataset* train_data, bool is_constant_hessian) override;
   Tree* Train(const score_t* gradients, const score_t* hessians, bool is_first_tree) override;
   void ResetTrainingData(const Dataset* train_data, bool is_constant_hessian) override;
+  Tree* FitByExistingTree(const Tree* old_tree, const score_t* gradients,
+                         const score_t* hessians) const override;
+  Tree* FitByExistingTree(const Tree* old_tree, const std::vector<int>& leaf_pred,
+                         const score_t* gradients, const score_t* hessians) const override;
 
  protected:
   void BeforeTrain() override;
   void ConstructHistograms(const std::vector<int8_t>& is_feature_used, bool use_subtract) override;
+  void FindBestSplitsFromHistograms(const std::vector<int8_t>& is_feature_used,
+                                    bool use_subtract, const Tree* tree) override;
+  void Split(Tree* tree, int best_leaf, int* left_leaf,
+             int* right_leaf) override;
 
  private:
-  /*! \brief 4-byte feature tuple used by GPU kernel (matches OpenCL GPUTreeLearner) */
-  struct Feature4 {
-    uint8_t s[4];
-  };
-
   typedef float gpu_hist_t;
 
   /*! \brief Initialize Metal device, load metallib, create pipeline */
   void InitMetal();
+  void ValidateTrainingScope(const Dataset* train_data) const;
 
-  /*! \brief Pack feature data into Feature4 format for GPU */
+  /*! \brief Allocate Metal buffers for gradient/hessian/indices */
   void AllocateMetalBuffers();
-
-  /*! \brief Build GPU histogram for given leaf data */
-  void BuildMetalHistogram(data_size_t num_data, const data_size_t* data_indices);
-
-  /*! \brief Wait for GPU and copy histogram results */
-  void WaitAndGetHistograms(hist_t* histograms);
 
   // Metal objects (opaque pointers to Objective-C types)
   void* metal_device_ = nullptr;
   void* metal_queue_ = nullptr;
   void* metal_library_ = nullptr;
-  void* histogram_pipeline_ = nullptr;
-  void* pending_command_buffer_ = nullptr;
+  void* histogram_pipeline_ = nullptr;         // column-grouped kernel
+  void* histogram_row_pipeline_ = nullptr;     // gathered sub-histogram kernel
+  void* reduction_pipeline_ = nullptr;         // sub-histogram reduction kernel
+  void* gather_pipeline_ = nullptr;            // gradient / bin reorder kernel
+  void* packed_histogram_pipeline_ = nullptr;  // packed-tuple histogram kernel
+  void* packed_reduction_pipeline_ = nullptr;  // packed-tuple reduction kernel
+  void* packed_gather_pipeline_ = nullptr;     // packed-tuple gather kernel
 
   // Metal buffers
-  void* features_buffer_ = nullptr;    // Feature4 packed data
-  void* gradients_buffer_ = nullptr;   // Cached gradient copy
-  void* hessians_buffer_ = nullptr;    // Cached hessian copy
+  void* gradients_buffer_ = nullptr;
+  void* hessians_buffer_ = nullptr;
+  void* ordered_grad_buffer_ = nullptr;       // pre-gathered for row-parallel
+  void* ordered_hess_buffer_ = nullptr;       // pre-gathered for row-parallel
+  void* ordered_bins_buffer_ = nullptr;       // pre-gathered bin data
+  void* ordered_packed_bins_buffer_ = nullptr;  // pre-gathered uchar4 tuples
+  void* subhist_buffer_ = nullptr;            // gathered sub-histogram scratch
   void* data_indices_buffer_ = nullptr;
-  void* histogram_output_buffer_ = nullptr;  // float histogram output
+  void* histogram_output_buffer_ = nullptr;
+
+  // Bin data (allocated on first use)
+  void* bin_data_col_buffer_ = nullptr;   // column-major [groups × rows]
+  void* bin_data_packed_buffer_ = nullptr;  // tuple-major [tuples × rows] of uchar4
+  void* bin_data_row_buffer_ = nullptr;   // unused
+  void* dense_group_map_buffer_ = nullptr;  // [tuples × 4] dense group ids
+  void* group_offsets_buffer_ = nullptr;
+  bool bin_data_packed_ = false;
+  bool use_row_parallel_ = false;         // auto-selected based on feature count
+  std::vector<uint32_t> group_bin_offsets_;
+  std::vector<uint32_t> dense_group_map_;
+  std::unique_ptr<MetalBestSplitFinder> best_split_finder_;
 
   // Feature layout
   int num_feature_groups_;
   int num_dense_feature_groups_;
-  int num_dense_feature4_;
-  int dword_features_;
-  int device_bin_size_;
-  size_t hist_bin_entry_sz_;
-  std::vector<int> dense_feature_group_map_;
-  std::vector<int> sparse_feature_group_map_;
-  std::vector<int> device_bin_mults_;
-  std::vector<char> feature_masks_;
+  int num_dense_feature_tuples_ = 0;
   int max_num_bin_;
-  std::string kernel_name_;
-
-  // GPU histogram data
-  void* bin_data_buffer_ = nullptr;     // Packed row-major bin data
-  void* group_offsets_buffer_ = nullptr;// Group bin boundary offsets
-  bool bin_data_packed_ = false;
-  std::vector<uint32_t> group_bin_offsets_;
 };
 
 }  // namespace LightGBM

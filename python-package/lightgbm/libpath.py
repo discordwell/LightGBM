@@ -23,6 +23,7 @@ def _find_lib_path() -> List[str]:
         curr_path.parents[1],
         curr_path.parents[0] / "bin",
         curr_path.parents[0] / "lib",
+        curr_path.parents[2],
     ]
     if system() in ("Windows", "Microsoft"):
         dll_path.append(curr_path.parents[1] / "Release")

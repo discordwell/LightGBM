@@ -268,11 +268,17 @@ Core Parameters
 
    -  ``gpu`` can be faster than ``cpu`` and works on a wider range of GPUs than CUDA
 
+   -  ``metal`` uses Apple Metal for GPU-accelerated training on macOS with Apple Silicon
+
+   -  **Note**: ``metal`` is performance-first and currently supports only ``tree_learner=serial``, ``boosting=gbdt``, dense numerical features, and ``max_bin <= 256``
+
    -  **Note**: it is recommended to use the smaller ``max_bin`` (e.g. 63) to get the better speed up
 
    -  **Note**: for the faster speed, GPU uses 32-bit float point to sum up by default, so this may affect the accuracy for some tasks. You can set ``gpu_use_dp=true`` to enable 64-bit float point, but it will slow down the training
 
-   -  **Note**: refer to `Installation Guide <./Installation-Guide.rst>`__ to build LightGBM with GPU, CUDA, or ROCm support
+   -  **Note**: ``metal`` always uses 32-bit float. ``gpu_use_dp`` is not supported with Metal
+
+   -  **Note**: refer to `Installation Guide <./Installation-Guide.rst>`__ to build LightGBM with GPU, CUDA, ROCm, or Metal support
 
 -  ``seed`` :raw-html:`<a id="seed" title="Permalink to this parameter" href="#seed">&#x1F517;&#xFE0E;</a>`, default = ``None``, type = int, aliases: ``random_seed``, ``random_state``
 

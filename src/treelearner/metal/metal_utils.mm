@@ -8,8 +8,8 @@
 
 // C++ standard headers first (before ObjC imports to avoid namespace conflicts)
 #include "metal_utils.hpp"
-#include "metal_leaf_splits.hpp"
 #include "metal_best_split_finder.hpp"
+#include "metal_leaf_splits.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -35,10 +35,8 @@ static std::unordered_map<std::string, id<MTLComputePipelineState>> g_pipelines;
 static void InitDevice() {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    fprintf(stderr, "[Metal] InitDevice: creating device...\n");
     g_device = MTLCreateSystemDefaultDevice();
     METAL_CHECK(g_device != nil, "No Metal device found");
-    fprintf(stderr, "[Metal] InitDevice: %s\n", [[g_device name] UTF8String]);
   });
 }
 
@@ -60,6 +58,11 @@ static NSString* FindMetallibPathInternal() {
     if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
       return candidate;
     }
+    candidate = [[dir stringByAppendingPathComponent:@"build"]
+                     stringByAppendingPathComponent:@"lib_lightgbm.metallib"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+      return candidate;
+    }
     candidate = [[dir stringByAppendingPathComponent:@"../lib"]
                       stringByAppendingPathComponent:@"lib_lightgbm.metallib"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
@@ -68,6 +71,11 @@ static NSString* FindMetallibPathInternal() {
   }
   NSString* cwd = [[NSFileManager defaultManager] currentDirectoryPath];
   NSString* candidate = [cwd stringByAppendingPathComponent:@"lib_lightgbm.metallib"];
+  if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+    return candidate;
+  }
+  candidate = [[cwd stringByAppendingPathComponent:@"build"]
+                   stringByAppendingPathComponent:@"lib_lightgbm.metallib"];
   if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
     return candidate;
   }
@@ -163,20 +171,16 @@ void MetalBuffer<T>::Release() {
   size_ = 0;
 }
 
-// Explicit instantiations for all types used in the tree learner pipeline.
-template class MetalBuffer<int8_t>;
+// Explicit instantiations for types used by MetalSingleGPUTreeLearner.
 template class MetalBuffer<uint8_t>;
-template class MetalBuffer<int16_t>;
-template class MetalBuffer<uint16_t>;
+template class MetalBuffer<int8_t>;
 template class MetalBuffer<int32_t>;
-template class MetalBuffer<int64_t>;
 template class MetalBuffer<uint32_t>;
-template class MetalBuffer<uint64_t>;
 template class MetalBuffer<float>;
 template class MetalBuffer<double>;
 template class MetalBuffer<MetalLeafSplitsStruct>;
-template class MetalBuffer<MetalSplitResult>;
 template class MetalBuffer<MetalSplitFindTask>;
+template class MetalBuffer<MetalSplitResult>;
 
 }  // namespace LightGBM
 

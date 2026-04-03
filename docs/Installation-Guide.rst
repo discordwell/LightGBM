@@ -684,6 +684,30 @@ macOS
 
 The GPU version is not supported on macOS.
 
+Build Metal Version
+~~~~~~~~~~~~~~~~~~~
+
+The Metal-based version of LightGBM (``device_type=metal``) targets macOS on Apple Silicon.
+It is a separate backend from the OpenCL (``device_type=gpu``) and CUDA (``device_type=cuda``) implementations.
+
+The current Metal backend is performance-first and intentionally narrow.
+It supports only ``tree_learner=serial``, ``boosting=gbdt``, dense numerical features, and ``max_bin <= 256``.
+Unsupported configurations fail fast instead of silently falling back.
+
+macOS
+^^^^^
+
+On macOS with Apple Silicon, a Metal version of LightGBM can be built using
+
+.. code:: sh
+
+     git clone --recursive https://github.com/microsoft/LightGBM
+     cd LightGBM
+     cmake -B build -S . -DLGBM_USE_METAL=ON
+     cmake --build build -j4
+
+After compilation the executable and ``.dylib`` files will be in the ``LightGBM/`` folder, and ``lib_lightgbm.metallib`` will be in ``LightGBM/build/``.
+
 Docker
 ^^^^^^
 

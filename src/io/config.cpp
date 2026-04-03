@@ -431,8 +431,7 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
       Log::Warning("Although \"deterministic\" is set, the results ran by Metal GPU may be non-deterministic.");
     }
     if (use_quantized_grad) {
-      Log::Warning("Quantized training is not supported by Metal tree learner. Switching to full precision.");
-      use_quantized_grad = false;
+      Log::Fatal("Quantized training is not supported by Metal tree learner.");
     }
     if (gpu_use_dp) {
       Log::Warning("Metal does not support double precision. Setting gpu_use_dp=false.");
@@ -441,6 +440,9 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
   }
   // linear tree learner must be serial type and run on CPU device
   if (linear_tree) {
+    if (device_type == std::string("metal")) {
+      Log::Fatal("Linear tree learner is not supported by Metal tree learner.");
+    }
     if (device_type != std::string("cpu") && device_type != std::string("gpu")) {
       device_type = "cpu";
       Log::Warning("Linear tree learner only works with CPU and GPU. Falling back to CPU now.");
