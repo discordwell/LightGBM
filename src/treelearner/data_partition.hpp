@@ -145,6 +145,15 @@ class DataPartition {
   data_size_t leaf_begin(int leaf) const { return leaf_begin_[leaf]; }
 
   const data_size_t* indices() const { return indices_.data(); }
+  data_size_t* mutable_indices() { return indices_.data(); }
+
+  void ApplyExternalSplit(int leaf, int right_leaf, data_size_t left_count) {
+    const data_size_t begin = leaf_begin_[leaf];
+    const data_size_t cnt = leaf_count_[leaf];
+    leaf_count_[leaf] = left_count;
+    leaf_begin_[right_leaf] = begin + left_count;
+    leaf_count_[right_leaf] = cnt - left_count;
+  }
 
   /*! \brief Get number of leaves */
   int num_leaves() const { return num_leaves_; }

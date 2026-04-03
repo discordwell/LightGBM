@@ -24,9 +24,9 @@ class MetalBestSplitFinder;
  * Current v1 scope is performance-first and intentionally narrow: dense
  * numerical data only, serial GBDT only, and max_bin <= 256. Histogram
  * construction is dispatched to Metal; the serial CPU loop still owns tree
- * mutation and data partitioning, and remains the default split-search path
- * until the experimental Metal split finder is fast enough to help end-to-end
- * wall time.
+ * mutation and data partitioning by default, and remains the default
+ * split-search path until the experimental Metal split finder / partitioner
+ * are fast enough to help end-to-end wall time.
  *
  * Two kernel strategies, auto-selected based on feature count:
  *  - Row-parallel (wide datasets): one thread per row, all features per thread.
@@ -75,6 +75,7 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void* packed_histogram_pipeline_ = nullptr;  // packed-tuple histogram kernel
   void* packed_reduction_pipeline_ = nullptr;  // packed-tuple reduction kernel
   void* packed_gather_pipeline_ = nullptr;     // packed-tuple gather kernel
+  void* partition_pipeline_ = nullptr;         // numerical partition kernel
 
   // Metal buffers
   void* gradients_buffer_ = nullptr;
@@ -85,6 +86,8 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void* ordered_packed_bins_buffer_ = nullptr;  // pre-gathered uchar4 tuples
   void* subhist_buffer_ = nullptr;            // gathered sub-histogram scratch
   void* data_indices_buffer_ = nullptr;
+  void* partition_output_buffer_ = nullptr;
+  void* partition_counts_buffer_ = nullptr;
   void* histogram_output_buffer_ = nullptr;
 
   // Bin data (allocated on first use)
@@ -104,6 +107,9 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   int num_dense_feature_groups_;
   int num_dense_feature_tuples_ = 0;
   int max_num_bin_;
+
+  data_size_t PartitionLeafOnGPU(int leaf, int inner_feature_index,
+                                 uint32_t threshold, bool default_left);
 };
 
 }  // namespace LightGBM

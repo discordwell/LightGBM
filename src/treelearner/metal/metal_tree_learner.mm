@@ -10,6 +10,8 @@
 #include "metal_tree_learner.hpp"
 #include "metal_utils.hpp"
 
+#include "../cost_effective_gradient_boosting.hpp"
+
 #include <LightGBM/bin.h>
 #include <LightGBM/network.h>
 
@@ -49,6 +51,8 @@ MetalSingleGPUTreeLearner::~MetalSingleGPUTreeLearner() {
     release(ordered_bins_buffer_);
     release(ordered_hess_buffer_);
     release(ordered_grad_buffer_);
+    release(partition_output_buffer_);
+    release(partition_counts_buffer_);
     release(histogram_output_buffer_);
     release(data_indices_buffer_);
     release(hessians_buffer_);
@@ -58,6 +62,7 @@ MetalSingleGPUTreeLearner::~MetalSingleGPUTreeLearner() {
     release(bin_data_row_buffer_);
     release(dense_group_map_buffer_);
     release(group_offsets_buffer_);
+    release(partition_pipeline_);
     release(packed_gather_pipeline_);
     release(packed_reduction_pipeline_);
     release(packed_histogram_pipeline_);
@@ -354,6 +359,16 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
             [dev newComputePipelineStateWithFunction:func error:&error];
         METAL_CHECK(pso != nil, "Failed to create grouped pipeline");
         replace(histogram_pipeline_, pso);
+      }
+
+      {
+        id<MTLFunction> func = [lib newFunctionWithName:@"partition_indices_numeric"];
+        METAL_CHECK(func != nil, "partition_indices_numeric kernel not found");
+        error = nil;
+        id<MTLComputePipelineState> pso =
+            [dev newComputePipelineStateWithFunction:func error:&error];
+        METAL_CHECK(pso != nil, "Failed to create partition pipeline");
+        replace(partition_pipeline_, pso);
       }
 
       if (use_row_parallel_) {
@@ -744,11 +759,124 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
   log_stage("split/refine_larger");
 }
 
+data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
+    int leaf,
+    int inner_feature_index,
+    uint32_t threshold,
+    bool default_left) {
+  CHECK(partition_pipeline_ != nullptr);
+  const int group = train_data_->Feature2Group(inner_feature_index);
+  CHECK(group >= 0);
+  const data_size_t begin = data_partition_->leaf_begin(leaf);
+  const data_size_t cnt = data_partition_->leaf_count(leaf);
+  const data_size_t* leaf_indices = data_partition_->indices() + begin;
+
+  @autoreleasepool {
+    id<MTLBuffer> input_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
+    std::memcpy([input_buf contents], leaf_indices, cnt * sizeof(data_size_t));
+
+    id<MTLBuffer> count_buf = (__bridge id<MTLBuffer>)partition_counts_buffer_;
+    std::memset([count_buf contents], 0, 2 * sizeof(uint32_t));
+
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal_queue_;
+    id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+    id<MTLComputePipelineState> pso =
+        (__bridge id<MTLComputePipelineState>)partition_pipeline_;
+
+    const BinMapper* bin_mapper = train_data_->FeatureBinMapper(inner_feature_index);
+    const uint32_t most_freq_bin = bin_mapper->GetMostFreqBin();
+    const uint32_t max_bin =
+        static_cast<uint32_t>(train_data_->FeatureGroupNumBin(group) - 1);
+    const uint32_t raw_threshold =
+        threshold + (most_freq_bin == 0 ? 0u : 1u);
+    const uint32_t raw_default_bin =
+        bin_mapper->GetDefaultBin() + (most_freq_bin == 0 ? 0u : 1u);
+    const MissingType missing_type = bin_mapper->missing_type();
+    const int32_t split_default_to_left =
+        (most_freq_bin <= threshold) ? 1 : 0;
+    const int32_t split_missing_default_to_left =
+        ((missing_type == MissingType::Zero ||
+          missing_type == MissingType::NaN) && default_left) ? 1 : 0;
+    const int32_t missing_is_zero = missing_type == MissingType::Zero ? 1 : 0;
+    const int32_t missing_is_na = missing_type == MissingType::NaN ? 1 : 0;
+    const int32_t mfb_is_zero =
+        (missing_type == MissingType::Zero &&
+         bin_mapper->GetDefaultBin() == most_freq_bin) ? 1 : 0;
+    const int32_t mfb_is_na =
+        (missing_type == MissingType::NaN && most_freq_bin > 0 &&
+         most_freq_bin + 1 == max_bin) ? 1 : 0;
+    const uint32_t num_data_in_leaf = static_cast<uint32_t>(cnt);
+
+    [encoder setComputePipelineState:pso];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)bin_data_col_buffer_
+                offset:static_cast<NSUInteger>(group) * static_cast<NSUInteger>(num_data_)
+               atIndex:0];
+    [encoder setBuffer:input_buf offset:0 atIndex:1];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)partition_output_buffer_ offset:0 atIndex:2];
+    [encoder setBuffer:count_buf offset:0 atIndex:3];
+    [encoder setBytes:&num_data_in_leaf length:sizeof(num_data_in_leaf) atIndex:4];
+    [encoder setBytes:&raw_threshold length:sizeof(raw_threshold) atIndex:5];
+    [encoder setBytes:&raw_default_bin length:sizeof(raw_default_bin) atIndex:6];
+    [encoder setBytes:&max_bin length:sizeof(max_bin) atIndex:7];
+    [encoder setBytes:&split_default_to_left
+                length:sizeof(split_default_to_left) atIndex:8];
+    [encoder setBytes:&split_missing_default_to_left
+                length:sizeof(split_missing_default_to_left) atIndex:9];
+    [encoder setBytes:&missing_is_zero length:sizeof(missing_is_zero) atIndex:10];
+    [encoder setBytes:&missing_is_na length:sizeof(missing_is_na) atIndex:11];
+    [encoder setBytes:&mfb_is_zero length:sizeof(mfb_is_zero) atIndex:12];
+    [encoder setBytes:&mfb_is_na length:sizeof(mfb_is_na) atIndex:13];
+
+    const NSUInteger tg =
+        std::min(256u, static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
+    [encoder dispatchThreadgroups:MTLSizeMake((num_data_in_leaf + tg - 1) / tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [encoder endEncoding];
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+    METAL_CHECK([cmd_buf status] != MTLCommandBufferStatusError,
+                [[[cmd_buf error] localizedDescription] UTF8String]);
+
+    const uint32_t* counts =
+        reinterpret_cast<const uint32_t*>([count_buf contents]);
+    const uint32_t left_count = counts[0];
+    const uint32_t right_count = counts[1];
+    CHECK_EQ(static_cast<uint32_t>(cnt), left_count + right_count);
+
+    std::memcpy(data_partition_->mutable_indices() + begin,
+                [(__bridge id<MTLBuffer>)partition_output_buffer_ contents],
+                cnt * sizeof(data_size_t));
+    return static_cast<data_size_t>(left_count);
+  }
+}
+
 void MetalSingleGPUTreeLearner::Split(
     Tree* tree,
     int best_leaf,
     int* left_leaf,
     int* right_leaf) {
+  Common::FunctionTimer fun_timer("MetalSingleGPUTreeLearner::Split", global_timer);
+  const bool enable_gpu_partition =
+      std::getenv("LIGHTGBM_METAL_ENABLE_GPU_PARTITION") != nullptr &&
+      std::getenv("LIGHTGBM_METAL_DISABLE_GPU_PARTITION") == nullptr;
+  if (!enable_gpu_partition) {
+    SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+    return;
+  }
+  const bool stage_timing =
+      std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
+  auto stage_start = std::chrono::steady_clock::now();
+  auto log_stage = [&](const char* name) {
+    if (!stage_timing) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(
+        now - stage_start).count();
+    Log::Info("[MetalTiming] %s took %.3f ms", name, ms);
+    stage_start = now;
+  };
   if (std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
     const SplitInfo& split = best_split_per_leaf_[best_leaf];
     fprintf(stderr,
@@ -758,7 +886,92 @@ void MetalSingleGPUTreeLearner::Split(
             static_cast<int>(split.right_count), split.gain,
             static_cast<int>(split.default_left));
   }
-  SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+  SplitInfo& best_split_info = best_split_per_leaf_[best_leaf];
+  const int inner_feature_index =
+      train_data_->InnerFeatureIndex(best_split_info.feature);
+  if (cegb_ != nullptr) {
+    cegb_->UpdateLeafBestSplits(tree, best_leaf, &best_split_info,
+                                &best_split_per_leaf_);
+  }
+  *left_leaf = best_leaf;
+  const int next_leaf_id = tree->NextLeafId();
+
+  constraints_->BeforeSplit(best_leaf, next_leaf_id,
+                            best_split_info.monotone_type);
+
+  const bool is_numerical_split =
+      train_data_->FeatureBinMapper(inner_feature_index)->bin_type() ==
+      BinType::NumericalBin;
+  if (!is_numerical_split) {
+    Log::Fatal("Metal tree learner only supports numerical splits.");
+  }
+
+  const data_size_t left_count = PartitionLeafOnGPU(
+      best_leaf, inner_feature_index, best_split_info.threshold,
+      best_split_info.default_left);
+  const data_size_t total_count = data_partition_->leaf_count(best_leaf);
+  const data_size_t right_count = total_count - left_count;
+  data_partition_->ApplyExternalSplit(best_leaf, next_leaf_id, left_count);
+  best_split_info.left_count = left_count;
+  best_split_info.right_count = right_count;
+  log_stage("partition/gpu");
+
+  const auto threshold_double =
+      train_data_->RealThreshold(inner_feature_index, best_split_info.threshold);
+  *right_leaf = tree->Split(
+      best_leaf, inner_feature_index, best_split_info.feature,
+      best_split_info.threshold, threshold_double,
+      static_cast<double>(best_split_info.left_output),
+      static_cast<double>(best_split_info.right_output),
+      static_cast<data_size_t>(best_split_info.left_count),
+      static_cast<data_size_t>(best_split_info.right_count),
+      static_cast<double>(best_split_info.left_sum_hessian),
+      static_cast<double>(best_split_info.right_sum_hessian),
+      static_cast<float>(best_split_info.gain + config_->min_gain_to_split),
+      train_data_->FeatureBinMapper(inner_feature_index)->missing_type(),
+      best_split_info.default_left);
+  log_stage("partition/tree_split");
+
+#ifdef DEBUG
+  CHECK(*right_leaf == next_leaf_id);
+#endif
+
+  if (best_split_info.left_count < best_split_info.right_count) {
+    CHECK_GT(best_split_info.left_count, 0);
+    smaller_leaf_splits_->Init(*left_leaf, data_partition_.get(),
+                               best_split_info.left_sum_gradient,
+                               best_split_info.left_sum_hessian,
+                               best_split_info.left_output);
+    larger_leaf_splits_->Init(*right_leaf, data_partition_.get(),
+                              best_split_info.right_sum_gradient,
+                              best_split_info.right_sum_hessian,
+                              best_split_info.right_output);
+  } else {
+    CHECK_GT(best_split_info.right_count, 0);
+    smaller_leaf_splits_->Init(*right_leaf, data_partition_.get(),
+                               best_split_info.right_sum_gradient,
+                               best_split_info.right_sum_hessian,
+                               best_split_info.right_output);
+    larger_leaf_splits_->Init(*left_leaf, data_partition_.get(),
+                              best_split_info.left_sum_gradient,
+                              best_split_info.left_sum_hessian,
+                              best_split_info.left_output);
+  }
+  log_stage("partition/leaf_init");
+
+#ifdef DEBUG
+  CheckSplit(best_split_info, *left_leaf, *right_leaf);
+#endif
+
+  auto leaves_need_update = constraints_->Update(
+      true, *left_leaf, *right_leaf,
+      best_split_info.monotone_type, best_split_info.right_output,
+      best_split_info.left_output, inner_feature_index, best_split_info,
+      best_split_per_leaf_);
+  for (auto leaf : leaves_need_update) {
+    RecomputeBestSplitForLeaf(tree, leaf, &best_split_per_leaf_[leaf]);
+  }
+  log_stage("partition/constraints");
 }
 
 // ============================================================================
@@ -780,6 +993,8 @@ void MetalSingleGPUTreeLearner::AllocateMetalBuffers() {
     alloc(gradients_buffer_, num_data_ * sizeof(score_t));
     alloc(hessians_buffer_, num_data_ * sizeof(score_t));
     alloc(data_indices_buffer_, num_data_ * sizeof(data_size_t));
+    alloc(partition_output_buffer_, num_data_ * sizeof(data_size_t));
+    alloc(partition_counts_buffer_, 2 * sizeof(uint32_t));
   }
 }
 

@@ -465,6 +465,65 @@ kernel void histogram_grouped(
 }
 
 // ===========================================================================
+// partition_indices_numeric — partition one leaf for a numerical split
+//
+// Supported Metal scope only allows dense numerical features, so the split
+// rule matches Tree::NumericalDecisionInner on raw bin values:
+//   - missing Zero routes by default bin
+//   - missing NaN routes by max bin
+//   - otherwise compare bin <= threshold
+//
+// Left rows are packed from the front, right rows from the back. Order within
+// each side is not stable, which matches the existing non-stable CPU partition.
+// ===========================================================================
+
+kernel void partition_indices_numeric(
+    const device uchar*   group_bins        [[buffer(0)]],
+    const device int*     input_indices     [[buffer(1)]],
+    device int*           output_indices    [[buffer(2)]],
+    device atomic_uint*   partition_counts  [[buffer(3)]],  // [left_count, right_count]
+    constant uint&        num_data_in_leaf  [[buffer(4)]],
+    constant uint&        threshold         [[buffer(5)]],   // threshold in stored-bin space
+    constant uint&        default_bin       [[buffer(6)]],   // default bin in stored-bin space
+    constant uint&        max_bin           [[buffer(7)]],
+    constant int&         split_default_to_left [[buffer(8)]],
+    constant int&         split_missing_default_to_left [[buffer(9)]],
+    constant int&         missing_is_zero   [[buffer(10)]],
+    constant int&         missing_is_na     [[buffer(11)]],
+    constant int&         mfb_is_zero       [[buffer(12)]],
+    constant int&         mfb_is_na         [[buffer(13)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_data_in_leaf) return;
+
+    const int row = input_indices[gid];
+    const uint bin = group_bins[row];
+    bool go_left = false;
+    if ((missing_is_zero && !mfb_is_zero && bin == default_bin) ||
+        (missing_is_na && !mfb_is_na && bin == max_bin)) {
+        go_left = (split_missing_default_to_left != 0);
+    } else if (bin == 0) {
+        if ((missing_is_na && mfb_is_na) || missing_is_zero || mfb_is_zero) {
+            go_left = (split_missing_default_to_left != 0);
+        } else {
+            go_left = (split_default_to_left != 0);
+        }
+    } else if (bin <= threshold) {
+        go_left = true;
+    }
+
+    if (go_left) {
+        const uint pos = atomic_fetch_add_explicit(
+            &partition_counts[0], 1u, memory_order_relaxed);
+        output_indices[pos] = row;
+    } else {
+        const uint pos = atomic_fetch_add_explicit(
+            &partition_counts[1], 1u, memory_order_relaxed);
+        output_indices[num_data_in_leaf - 1u - pos] = row;
+    }
+}
+
+// ===========================================================================
 // find_best_split_numeric — sequential per-task numeric split scan
 //
 // The histogram path already dominates runtime on Apple Silicon. For split
