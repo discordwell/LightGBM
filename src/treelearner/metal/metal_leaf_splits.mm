@@ -99,6 +99,18 @@ void MetalLeafSplits::InitValues() {
   InitValues(0);
 }
 
+void MetalLeafSplits::UpdateLeaf(size_t slot,
+                                 int leaf_index,
+                                 double sum_gradients,
+                                 double sum_hessians,
+                                 data_size_t num_data_in_leaf,
+                                 double leaf_value,
+                                 data_size_t data_indices_offset,
+                                 int64_t hist_offset) {
+  SetLeafState(slot, leaf_index, sum_gradients, sum_hessians, num_data_in_leaf,
+               leaf_value, data_indices_offset, hist_offset);
+}
+
 void MetalLeafSplits::InitValues(size_t slot) {
   CHECK_LT(slot, num_slots_);
   MetalLeafSplitsStruct* s = GetStruct(slot);

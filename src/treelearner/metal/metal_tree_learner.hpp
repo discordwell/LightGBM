@@ -66,7 +66,12 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
 
   /*! \brief Allocate Metal buffers for gradient/hessian/indices */
   void AllocateMetalBuffers();
+  void ResetMetalLeafStateTable();
   void SyncMetalActiveLeafState();
+  void SyncMetalLeafState(int leaf_index, const LeafSplits* leaf_splits);
+  void UpdateMetalLeafState(int leaf_index, double sum_gradients,
+                            double sum_hessians, data_size_t num_data_in_leaf,
+                            double leaf_value);
   double GetMetalParentOutput(const Tree* tree,
                               const MetalLeafSplitsStruct* leaf_state) const;
   const MetalLeafSplitsStruct* GetActiveMetalLeafState(size_t slot) const;

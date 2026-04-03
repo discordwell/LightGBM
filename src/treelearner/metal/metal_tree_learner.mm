@@ -82,7 +82,8 @@ MetalSingleGPUTreeLearner::~MetalSingleGPUTreeLearner() {
 void MetalSingleGPUTreeLearner::Init(const Dataset* train_data,
                                      bool is_constant_hessian) {
   SerialTreeLearner::Init(train_data, is_constant_hessian);
-  metal_leaf_splits_.reset(new MetalLeafSplits(num_data_, 2));
+  metal_leaf_splits_.reset(
+      new MetalLeafSplits(num_data_, static_cast<size_t>(config_->num_leaves)));
   ValidateTrainingScope(train_data_);
   num_feature_groups_ = train_data_->num_feature_groups();
   best_split_finder_.reset(new MetalBestSplitFinder(
@@ -203,33 +204,66 @@ void MetalSingleGPUTreeLearner::InitMetal() {
 
 const MetalLeafSplitsStruct* MetalSingleGPUTreeLearner::GetActiveMetalLeafState(
     size_t slot) const {
-  CHECK(metal_leaf_splits_ != nullptr);
-  CHECK_LT(slot, metal_leaf_splits_->num_slots());
-  return metal_leaf_splits_->GetStruct(slot);
+  const LeafSplits* leaf_splits =
+      slot == kSmallerLeafSlot ? smaller_leaf_splits_.get() : larger_leaf_splits_.get();
+  if (leaf_splits == nullptr || leaf_splits->leaf_index() < 0) {
+    return nullptr;
+  }
+  return FindActiveMetalLeafState(leaf_splits->leaf_index());
 }
 
 const MetalLeafSplitsStruct* MetalSingleGPUTreeLearner::FindActiveMetalLeafState(
     int leaf_index) const {
-  if (metal_leaf_splits_ == nullptr) {
+  if (metal_leaf_splits_ == nullptr || leaf_index < 0 ||
+      static_cast<size_t>(leaf_index) >= metal_leaf_splits_->num_slots()) {
     return nullptr;
   }
-  for (size_t slot = 0; slot < metal_leaf_splits_->num_slots(); ++slot) {
-    const MetalLeafSplitsStruct* leaf_state = metal_leaf_splits_->GetStruct(slot);
-    if (leaf_state->leaf_index == leaf_index) {
-      return leaf_state;
-    }
+  const MetalLeafSplitsStruct* leaf_state =
+      metal_leaf_splits_->GetStruct(static_cast<size_t>(leaf_index));
+  return leaf_state->leaf_index == leaf_index ? leaf_state : nullptr;
+}
+
+void MetalSingleGPUTreeLearner::ResetMetalLeafStateTable() {
+  if (metal_leaf_splits_ == nullptr) {
+    metal_leaf_splits_.reset(
+        new MetalLeafSplits(num_data_, static_cast<size_t>(config_->num_leaves)));
+  } else {
+    metal_leaf_splits_->ResizeSlots(static_cast<size_t>(config_->num_leaves));
   }
-  return nullptr;
+  metal_leaf_splits_->Reset();
+}
+
+void MetalSingleGPUTreeLearner::SyncMetalLeafState(int leaf_index,
+                                                   const LeafSplits* leaf_splits) {
+  if (leaf_index < 0 || leaf_splits == nullptr || metal_leaf_splits_ == nullptr) {
+    return;
+  }
+  CHECK_EQ(leaf_splits->leaf_index(), leaf_index);
+  metal_leaf_splits_->SyncLeaf(static_cast<size_t>(leaf_index), leaf_splits,
+                               data_partition_.get());
+}
+
+void MetalSingleGPUTreeLearner::UpdateMetalLeafState(
+    int leaf_index,
+    double sum_gradients,
+    double sum_hessians,
+    data_size_t num_data_in_leaf,
+    double leaf_value) {
+  if (leaf_index < 0 || metal_leaf_splits_ == nullptr) {
+    return;
+  }
+  metal_leaf_splits_->UpdateLeaf(static_cast<size_t>(leaf_index), leaf_index,
+                                 sum_gradients, sum_hessians, num_data_in_leaf,
+                                 leaf_value, data_partition_->leaf_begin(leaf_index));
 }
 
 void MetalSingleGPUTreeLearner::SyncMetalActiveLeafState() {
-  if (metal_leaf_splits_ == nullptr) {
-    metal_leaf_splits_.reset(new MetalLeafSplits(num_data_, 2));
+  if (smaller_leaf_splits_ != nullptr && smaller_leaf_splits_->leaf_index() >= 0) {
+    SyncMetalLeafState(smaller_leaf_splits_->leaf_index(), smaller_leaf_splits_.get());
   }
-  metal_leaf_splits_->SyncLeaf(kSmallerLeafSlot, smaller_leaf_splits_.get(),
-                               data_partition_.get());
-  metal_leaf_splits_->SyncLeaf(kLargerLeafSlot, larger_leaf_splits_.get(),
-                               data_partition_.get());
+  if (larger_leaf_splits_ != nullptr && larger_leaf_splits_->leaf_index() >= 0) {
+    SyncMetalLeafState(larger_leaf_splits_->leaf_index(), larger_leaf_splits_.get());
+  }
 }
 
 double MetalSingleGPUTreeLearner::GetMetalParentOutput(
@@ -284,6 +318,7 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
     }
   }
   SerialTreeLearner::BeforeTrain();
+  ResetMetalLeafStateTable();
   SyncMetalActiveLeafState();
   if (best_split_finder_ != nullptr) {
     best_split_finder_->BeforeTrain(col_sampler_.is_feature_used_bytree());
@@ -318,6 +353,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       GetActiveMetalLeafState(kSmallerLeafSlot);
   const MetalLeafSplitsStruct* larger_leaf =
       GetActiveMetalLeafState(kLargerLeafSlot);
+  CHECK(smaller_leaf != nullptr);
   const data_size_t num_data_in_leaf = smaller_leaf->num_data_in_leaf;
   const data_size_t* data_indices =
       data_partition_->indices() + smaller_leaf->data_indices_offset;
@@ -648,6 +684,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
   }
 
   if (larger_leaf_histogram_array_ != nullptr && !use_subtract &&
+      larger_leaf != nullptr &&
       larger_leaf->leaf_index >= 0 && larger_leaf->num_data_in_leaf > 0) {
     hist_t* ptr_larger = larger_leaf_histogram_array_[0].RawData() - kHistOffset;
     train_data_->ConstructHistograms<false, 0>(
@@ -693,8 +730,9 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
       GetActiveMetalLeafState(kSmallerLeafSlot);
   const MetalLeafSplitsStruct* larger_leaf =
       GetActiveMetalLeafState(kLargerLeafSlot);
+  CHECK(smaller_leaf != nullptr);
   const int smaller_leaf_index = smaller_leaf->leaf_index;
-  const int larger_leaf_index = larger_leaf->leaf_index;
+  const int larger_leaf_index = larger_leaf != nullptr ? larger_leaf->leaf_index : -1;
   std::vector<int8_t> smaller_node_used_features =
       col_sampler_.GetByNode(tree, smaller_leaf_index);
   std::vector<int8_t> larger_node_used_features;
@@ -1006,6 +1044,13 @@ void MetalSingleGPUTreeLearner::Split(
       train_data_->FeatureBinMapper(inner_feature_index)->missing_type(),
       best_split_info.default_left);
   log_stage("partition/tree_split");
+  UpdateMetalLeafState(*left_leaf, best_split_info.left_sum_gradient,
+                       best_split_info.left_sum_hessian,
+                       best_split_info.left_count, best_split_info.left_output);
+  UpdateMetalLeafState(*right_leaf, best_split_info.right_sum_gradient,
+                       best_split_info.right_sum_hessian,
+                       best_split_info.right_count, best_split_info.right_output);
+  log_stage("partition/update_leaf_state");
 
 #ifdef DEBUG
   CHECK(*right_leaf == next_leaf_id);
@@ -1033,8 +1078,6 @@ void MetalSingleGPUTreeLearner::Split(
                               best_split_info.left_output);
   }
   log_stage("partition/leaf_init");
-  SyncMetalActiveLeafState();
-  log_stage("partition/sync_leaf_state");
 
 #ifdef DEBUG
   CheckSplit(best_split_info, *left_leaf, *right_leaf);
@@ -1081,11 +1124,7 @@ void MetalSingleGPUTreeLearner::ResetTrainingData(
   ValidateTrainingScope(train_data_);
   num_feature_groups_ = train_data_->num_feature_groups();
   bin_data_packed_ = false;
-  if (metal_leaf_splits_ == nullptr) {
-    metal_leaf_splits_.reset(new MetalLeafSplits(num_data_, 2));
-  } else {
-    metal_leaf_splits_->ResizeSlots(2);
-  }
+  ResetMetalLeafStateTable();
   if (best_split_finder_ != nullptr) {
     best_split_finder_->ResetTrainingData(
         train_data_, share_state_->feature_hist_offsets());

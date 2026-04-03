@@ -66,6 +66,10 @@ class MetalLeafSplits {
   void InitValues();
   void InitValues(size_t slot);
 
+  void UpdateLeaf(size_t slot, int leaf_index, double sum_gradients,
+                  double sum_hessians, data_size_t num_data_in_leaf,
+                  double leaf_value, data_size_t data_indices_offset,
+                  int64_t hist_offset = 0);
   void SyncLeaf(size_t slot, const LeafSplits* leaf_splits,
                 const DataPartition* data_partition, int64_t hist_offset = 0);
 
