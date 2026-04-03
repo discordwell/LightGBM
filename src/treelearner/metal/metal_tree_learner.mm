@@ -911,6 +911,7 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
     const int32_t mfb_is_na =
         (missing_type == MissingType::NaN && most_freq_bin > 0 &&
          most_freq_bin + 1 == max_bin) ? 1 : 0;
+    const int32_t max_bin_to_left = raw_threshold >= max_bin ? 1 : 0;
     const uint32_t num_data_in_leaf = static_cast<uint32_t>(cnt);
 
     [encoder setComputePipelineState:pso];
@@ -932,6 +933,7 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
     [encoder setBytes:&missing_is_na length:sizeof(missing_is_na) atIndex:11];
     [encoder setBytes:&mfb_is_zero length:sizeof(mfb_is_zero) atIndex:12];
     [encoder setBytes:&mfb_is_na length:sizeof(mfb_is_na) atIndex:13];
+    [encoder setBytes:&max_bin_to_left length:sizeof(max_bin_to_left) atIndex:14];
 
     const NSUInteger tg =
         std::min(256u, static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));

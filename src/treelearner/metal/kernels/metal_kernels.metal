@@ -492,6 +492,7 @@ kernel void partition_indices_numeric(
     constant int&         missing_is_na     [[buffer(11)]],
     constant int&         mfb_is_zero       [[buffer(12)]],
     constant int&         mfb_is_na         [[buffer(13)]],
+    constant int&         max_bin_to_left   [[buffer(14)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_data_in_leaf) return;
@@ -499,17 +500,36 @@ kernel void partition_indices_numeric(
     const int row = input_indices[gid];
     const uint bin = group_bins[row];
     bool go_left = false;
-    if ((missing_is_zero && !mfb_is_zero && bin == default_bin) ||
-        (missing_is_na && !mfb_is_na && bin == max_bin)) {
-        go_left = (split_missing_default_to_left != 0);
-    } else if (bin == 0) {
-        if ((missing_is_na && mfb_is_na) || missing_is_zero || mfb_is_zero) {
+
+    if (max_bin > 1u) {
+        if ((missing_is_zero && !mfb_is_zero && bin == default_bin) ||
+            (missing_is_na && !mfb_is_na && bin == max_bin)) {
+            go_left = (split_missing_default_to_left != 0);
+        } else if (bin == 0u) {
+            if ((missing_is_na && mfb_is_na) ||
+                (missing_is_zero && mfb_is_zero)) {
+                go_left = (split_missing_default_to_left != 0);
+            } else {
+                go_left = (split_default_to_left != 0);
+            }
+        } else if (bin <= threshold) {
+            go_left = true;
+        }
+    } else {
+        if (missing_is_zero && !mfb_is_zero && bin == default_bin) {
+            go_left = (split_missing_default_to_left != 0);
+        } else if (bin != max_bin) {
+            if ((missing_is_na && mfb_is_na) ||
+                (missing_is_zero && mfb_is_zero)) {
+                go_left = (split_missing_default_to_left != 0);
+            } else {
+                go_left = (split_default_to_left != 0);
+            }
+        } else if (missing_is_na && !mfb_is_na) {
             go_left = (split_missing_default_to_left != 0);
         } else {
-            go_left = (split_default_to_left != 0);
+            go_left = (max_bin_to_left != 0);
         }
-    } else if (bin <= threshold) {
-        go_left = true;
     }
 
     if (go_left) {
