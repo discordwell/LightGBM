@@ -869,18 +869,11 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
   const int group = train_data_->Feature2Group(inner_feature_index);
   CHECK(group >= 0);
   const MetalLeafSplitsStruct* leaf_state = FindActiveMetalLeafState(leaf);
-  const data_size_t begin = data_partition_->leaf_begin(leaf);
-  const data_size_t cnt = data_partition_->leaf_count(leaf);
-  if (leaf_state != nullptr &&
-      (leaf_state->data_indices_offset != begin ||
-       leaf_state->num_data_in_leaf != cnt) &&
-      std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
-    fprintf(stderr,
-            "[Metal] active leaf state mismatch for leaf=%d: state_offset=%d partition_offset=%d state_count=%d partition_count=%d\n",
-            leaf, static_cast<int>(leaf_state->data_indices_offset),
-            static_cast<int>(begin), static_cast<int>(leaf_state->num_data_in_leaf),
-            static_cast<int>(cnt));
-  }
+  CHECK(leaf_state != nullptr);
+  const data_size_t begin = leaf_state->data_indices_offset;
+  const data_size_t cnt = leaf_state->num_data_in_leaf;
+  CHECK_EQ(begin, data_partition_->leaf_begin(leaf));
+  CHECK_EQ(cnt, data_partition_->leaf_count(leaf));
   const data_size_t* leaf_indices = data_partition_->indices() + begin;
 
   @autoreleasepool {
