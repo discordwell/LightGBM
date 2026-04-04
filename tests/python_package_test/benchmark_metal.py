@@ -45,6 +45,7 @@ def _train_once(dataset: lgb.Dataset, params: dict, num_boost_round: int) -> flo
 
 def _benchmark_case(case: dict, cpu_threads: int) -> dict:
     dataset = _make_binary_data(case["rows"], case["features"], case["seed"])
+    metal_threads = 2
     base_params = {
         "objective": "binary",
         "metric": "None",
@@ -60,7 +61,7 @@ def _benchmark_case(case: dict, cpu_threads: int) -> dict:
         "deterministic": True,
     }
     cpu_params = dict(base_params, device_type="cpu", num_threads=cpu_threads)
-    metal_params = dict(base_params, device_type="metal", num_threads=1)
+    metal_params = dict(base_params, device_type="metal", num_threads=metal_threads)
 
     _train_once(dataset, cpu_params, case["rounds"])
     _train_once(dataset, metal_params, case["rounds"])
@@ -82,6 +83,7 @@ def _benchmark_case(case: dict, cpu_threads: int) -> dict:
 
 def main() -> None:
     cpu_threads = _physical_cpu_count()
+    metal_threads = 2
     cases = [
         {
             "name": "binary 50k x 200 x 10, max_bin=255",
@@ -110,6 +112,7 @@ def main() -> None:
     ]
 
     print(f"CPU baseline threads: {cpu_threads}")
+    print(f"Metal helper threads: {metal_threads}")
     print("Warm-up: 1 run per device, measured runs: 5, reported statistic: median")
     print()
 

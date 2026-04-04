@@ -427,6 +427,11 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
     // force row-wise for Metal version (matches CUDA)
     force_col_wise = false;
     force_row_wise = true;
+    if (num_threads == 0) {
+      // Metal still uses CPU helper work for orchestration and split refinement.
+      // A small helper pool is faster and more stable than the OpenMP default.
+      num_threads = 2;
+    }
     if (deterministic) {
       Log::Warning("Although \"deterministic\" is set, the results ran by Metal GPU may be non-deterministic.");
     }

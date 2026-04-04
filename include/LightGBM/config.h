@@ -238,6 +238,7 @@ struct Config {
   // desc = be aware a task manager or any similar CPU monitoring tool might report that cores not being fully utilized. **This is normal**
   // desc = for distributed learning, do not use all CPU cores because this will cause poor performance for the network communication
   // desc = **Note**: please **don't** change this during training, especially when running multiple jobs simultaneously by external packages, otherwise it may cause undesirable errors
+  // desc = **Note**: when ``device_type="metal"`` and ``num_threads=0``, LightGBM defaults to 2 CPU helper threads
   int num_threads = 0;
 
   // [no-automatically-extract]
