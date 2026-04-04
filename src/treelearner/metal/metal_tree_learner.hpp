@@ -68,6 +68,9 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void AllocateMetalBuffers();
   void SyncPartitionToGPU();
   void SyncPartitionRangeToCPU(data_size_t begin, data_size_t count);
+  bool ValidatePartitionSums(data_size_t begin, data_size_t left_count,
+                             data_size_t total_count,
+                             const SplitInfo& best_split_info) const;
   void ResetMetalLeafStateTable();
   void SyncMetalActiveLeafState();
   void SyncMetalLeafState(int leaf_index, const LeafSplits* leaf_splits);

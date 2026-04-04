@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -351,6 +352,58 @@ void MetalSingleGPUTreeLearner::SyncPartitionRangeToCPU(data_size_t begin,
     std::memcpy(data_partition_->mutable_indices() + begin, src,
                 static_cast<size_t>(count) * sizeof(data_size_t));
   }
+}
+
+bool MetalSingleGPUTreeLearner::ValidatePartitionSums(
+    data_size_t begin,
+    data_size_t left_count,
+    data_size_t total_count,
+    const SplitInfo& best_split_info) const {
+  if (data_partition_ == nullptr || total_count <= 0 || left_count > total_count) {
+    return false;
+  }
+  const data_size_t right_count = total_count - left_count;
+  if (left_count != static_cast<data_size_t>(best_split_info.left_count) ||
+      right_count != static_cast<data_size_t>(best_split_info.right_count)) {
+    return false;
+  }
+
+  const data_size_t* indices = data_partition_->indices() + begin;
+  double left_grad = 0.0;
+  double left_hess = 0.0;
+  for (data_size_t i = 0; i < left_count; ++i) {
+    const data_size_t idx = indices[i];
+    left_grad += gradients_[idx];
+    if (hessians_ != nullptr) {
+      left_hess += hessians_[idx];
+    }
+  }
+
+  double right_grad = 0.0;
+  double right_hess = 0.0;
+  for (data_size_t i = left_count; i < total_count; ++i) {
+    const data_size_t idx = indices[i];
+    right_grad += gradients_[idx];
+    if (hessians_ != nullptr) {
+      right_hess += hessians_[idx];
+    }
+  }
+
+  auto within_tol = [](double actual, double expected) {
+    const double tol = 1e-5 * std::max(1.0, std::fabs(expected));
+    return std::fabs(actual - expected) <= tol;
+  };
+  if (!within_tol(left_grad, best_split_info.left_sum_gradient) ||
+      !within_tol(right_grad, best_split_info.right_sum_gradient)) {
+    return false;
+  }
+  if (hessians_ != nullptr) {
+    if (!within_tol(left_hess, best_split_info.left_sum_hessian) ||
+        !within_tol(right_hess, best_split_info.right_sum_hessian)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ============================================================================
@@ -1157,7 +1210,6 @@ void MetalSingleGPUTreeLearner::Split(
     int* right_leaf) {
   Common::FunctionTimer fun_timer("MetalSingleGPUTreeLearner::Split", global_timer);
   const bool enable_gpu_partition =
-      std::getenv("LIGHTGBM_METAL_ENABLE_GPU_PARTITION") != nullptr &&
       std::getenv("LIGHTGBM_METAL_DISABLE_GPU_PARTITION") == nullptr;
   if (!enable_gpu_partition) {
     SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
@@ -1216,7 +1268,9 @@ void MetalSingleGPUTreeLearner::Split(
   const data_size_t right_count = total_count - left_count;
   if (left_count <= 0 || right_count <= 0 ||
       left_count != expected_left_count ||
-      right_count != expected_right_count) {
+      right_count != expected_right_count ||
+      !ValidatePartitionSums(data_partition_->leaf_begin(best_leaf), left_count,
+                             total_count, best_split_info)) {
     if (std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
       fprintf(stderr,
               "[Metal] partition mismatch on leaf=%d feature=%d threshold=%u expected=%d/%d actual=%d/%d; falling back to CPU partition\n",
