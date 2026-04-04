@@ -102,6 +102,8 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void* partition_output_buffer_ = nullptr;
   void* partition_counts_buffer_ = nullptr;
   void* histogram_output_buffer_ = nullptr;
+  void* leaf_hist_cache_buffer_ = nullptr;   // [num_leaves × total_bins × 2] float cache
+  void* leaf_hist_parent_buffer_ = nullptr;  // one histogram scratch when parent slot is reused
 
   // Bin data (allocated on first use)
   void* bin_data_col_buffer_ = nullptr;   // column-major [groups × rows]
@@ -121,6 +123,7 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   int num_dense_feature_groups_;
   int num_dense_feature_tuples_ = 0;
   int max_num_bin_;
+  size_t leaf_hist_num_items_ = 0;
 
   data_size_t PartitionLeafOnGPU(int leaf, int inner_feature_index,
                                  uint32_t threshold, bool default_left);

@@ -64,10 +64,14 @@ class MetalBestSplitFinder {
 
   void FindBestSplitsForLeaf(
       const hist_t* smaller_leaf_hist,
+      void* smaller_leaf_hist_buffer,
+      size_t smaller_leaf_hist_buffer_offset,
       const MetalLeafSplitsStruct* smaller_leaf_splits,
       int smaller_leaf_index,
       const std::vector<int8_t>& smaller_node_used_features,
       const hist_t* larger_leaf_hist,
+      void* larger_leaf_hist_buffer,
+      size_t larger_leaf_hist_buffer_offset,
       const MetalLeafSplitsStruct* larger_leaf_splits,
       int larger_leaf_index,
       const std::vector<int8_t>* larger_node_used_features);
@@ -87,13 +91,19 @@ class MetalBestSplitFinder {
   void ResetConfig(const Config* config);
 
  private:
+  static constexpr size_t kHistSlots = 2;
+
   void InitFeatureMetaInfo(const Dataset* train_data);
   void InitTasks();
   void UploadHistogram(const hist_t* src_hist, size_t slot);
-  void DispatchSplitKernel(const MetalLeafSplitsStruct* leaf_splits,
-                           int leaf_index,
-                           size_t hist_slot,
-                           const std::vector<int8_t>& node_feature_mask);
+  void DispatchSplitKernels(const MetalLeafSplitsStruct* const* leaf_splits,
+                            const int* leaf_indices,
+                            const std::vector<int8_t>* const* node_feature_masks,
+                            void* const* histogram_buffers,
+                            const size_t* histogram_offsets);
+  void ReduceBestFromTaskResults(int leaf_index,
+                                 size_t result_slot,
+                                 const std::vector<int8_t>& node_feature_mask);
   void ClearLeafBest(int leaf_index);
 
   int num_features_;

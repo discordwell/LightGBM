@@ -544,12 +544,11 @@ kernel void partition_indices_numeric(
 }
 
 // ===========================================================================
-// find_best_split_numeric — sequential per-task numeric split scan
+// find_best_split_numeric — one threadgroup per feature-direction task
 //
-// The histogram path already dominates runtime on Apple Silicon. For split
-// search, dispatching one task per feature-direction is enough to move the
-// hot scan off CPU without depending on newer Metal features or large
-// threadgroup reductions.
+// Mirrors the CUDA path more closely: one thread maps to one histogram bin,
+// threadgroup prefix sums produce cumulative left / right statistics, and a
+// threadgroup reduction selects the best threshold for that task.
 // ===========================================================================
 
 constant float kMetalSplitEpsilon = 1e-15f;
@@ -630,182 +629,233 @@ kernel void find_best_split_numeric(
     uint group_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    if (group_id >= num_tasks || tid != 0) {
+    if (group_id >= num_tasks) {
         return;
     }
 
     const device MetalSplitFindTaskKernel& task = tasks[group_id];
     device MetalSplitResultKernel& out = output_splits[group_id];
-
-    out.gain = kMetalSplitMinScore;
-    out.feature = -1;
-    out.threshold = 0;
-    out.default_left = task.assume_out_default_left;
-    out.left_sum_gradient = 0.0f;
-    out.left_sum_hessian = 0.0f;
-    out.left_count = 0;
-    out.right_sum_gradient = 0.0f;
-    out.right_sum_hessian = 0.0f;
-    out.right_count = 0;
-    out.left_value = 0.0f;
-    out.right_value = 0.0f;
-    out.found = 0;
-
-    if (!is_feature_used[task.inner_feature_index]) {
-        return;
-    }
-
+    const bool feature_used = is_feature_used[task.inner_feature_index] != 0;
     const float total_hessian = total_hessian_input + 2.0f * kMetalSplitEpsilon;
     const int total_count = static_cast<int>(total_count_input);
     const float cnt_factor = float(total_count_input) / total_hessian;
     const float min_gain_shift = parent_gain + min_gain_to_split;
-    const int offset = static_cast<int>(task.mfb_offset);
+    const uint offset = task.mfb_offset;
+    const uint feature_num_bin_minus_offset = task.num_bin - offset;
     const device float* hist = histogram + (task.hist_offset << 1);
 
-    float best_gain = kMetalSplitMinScore;
+    threadgroup float grad_scan[256];
+    threadgroup float hess_scan[256];
+    threadgroup float gain_scan[256];
+    threadgroup uint best_index_scan[256];
+    threadgroup uchar valid_scan[256];
+
+    if (tid == 0) {
+        out.gain = kMetalSplitMinScore;
+        out.feature = -1;
+        out.threshold = 0;
+        out.default_left = task.assume_out_default_left;
+        out.left_sum_gradient = 0.0f;
+        out.left_sum_hessian = 0.0f;
+        out.left_count = 0;
+        out.right_sum_gradient = 0.0f;
+        out.right_sum_hessian = 0.0f;
+        out.right_count = 0;
+        out.left_value = 0.0f;
+        out.right_value = 0.0f;
+        out.found = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_grad_hist = 0.0f;
+    float local_hess_hist = 0.0f;
+    const bool skip_sum = task.reverse
+        ? (task.skip_default_bin &&
+           (task.num_bin - 1u - tid) == task.default_bin)
+        : (task.skip_default_bin &&
+           (tid + offset) == task.default_bin);
+
+    if (feature_used) {
+        if (task.reverse == 0) {
+            if (task.na_as_missing != 0 && offset == 1u) {
+                if (tid > 0u && tid < task.num_bin) {
+                    const uint bin_offset = (tid - 1u) << 1;
+                    local_grad_hist = hist[bin_offset];
+                    local_hess_hist = hist[bin_offset + 1u];
+                }
+            } else if (tid < feature_num_bin_minus_offset && !skip_sum) {
+                const uint bin_offset = tid << 1;
+                local_grad_hist = hist[bin_offset];
+                local_hess_hist = hist[bin_offset + 1u];
+            }
+        } else if (tid >= uint(task.na_as_missing) &&
+                   tid < feature_num_bin_minus_offset && !skip_sum) {
+            const uint read_index = feature_num_bin_minus_offset - 1u - tid;
+            const uint bin_offset = read_index << 1;
+            local_grad_hist = hist[bin_offset];
+            local_hess_hist = hist[bin_offset + 1u];
+        }
+    }
+
+    if (feature_used && task.reverse == 0 &&
+        task.na_as_missing != 0 && offset == 1u) {
+        grad_scan[tid] = local_grad_hist;
+        hess_scan[tid] = local_hess_hist;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                grad_scan[tid] += grad_scan[tid + stride];
+                hess_scan[tid] += hess_scan[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            local_grad_hist += (total_gradient - grad_scan[0]);
+            local_hess_hist += (total_hessian_input - hess_scan[0]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        local_hess_hist += kMetalSplitEpsilon;
+    }
+
+    grad_scan[tid] = local_grad_hist;
+    hess_scan[tid] = local_hess_hist;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+        float add_grad = 0.0f;
+        float add_hess = 0.0f;
+        if (tid >= stride) {
+            add_grad = grad_scan[tid - stride];
+            add_hess = hess_scan[tid - stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid >= stride) {
+            grad_scan[tid] += add_grad;
+            hess_scan[tid] += add_hess;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float local_gain = kMetalSplitMinScore;
+    bool threshold_found = false;
+    uint threshold_value = 0u;
     float best_left_gradient = 0.0f;
     float best_left_hessian = 0.0f;
     int best_left_count = 0;
-    uint best_threshold = task.num_bin;
 
-    if (task.reverse) {
-        float sum_right_gradient = 0.0f;
-        float sum_right_hessian = kMetalSplitEpsilon;
-        int right_count = 0;
-
-        for (int t = static_cast<int>(task.num_bin) - 1 - offset - task.na_as_missing;
-             t >= 1 - offset; --t) {
-            if (task.skip_default_bin &&
-                (t + offset) == static_cast<int>(task.default_bin)) {
-                continue;
+    if (feature_used) {
+        if (task.reverse != 0) {
+            if (tid >= uint(task.na_as_missing) &&
+                tid < feature_num_bin_minus_offset &&
+                tid <= task.num_bin - 2u && !skip_sum) {
+                const float sum_right_gradient = grad_scan[tid];
+                const float sum_right_hessian = hess_scan[tid];
+                const int right_count = static_cast<int>(rint(sum_right_hessian * cnt_factor));
+                const float sum_left_gradient = total_gradient - sum_right_gradient;
+                const float sum_left_hessian = total_hessian - sum_right_hessian;
+                const int left_count = total_count - right_count;
+                if (sum_left_hessian >= min_sum_hessian_in_leaf &&
+                    left_count >= min_data_in_leaf &&
+                    sum_right_hessian >= min_sum_hessian_in_leaf &&
+                    right_count >= min_data_in_leaf) {
+                    const float current_gain = metal_split_gain(
+                        sum_left_gradient, sum_left_hessian,
+                        sum_right_gradient, sum_right_hessian,
+                        lambda_l1, lambda_l2);
+                    if (current_gain > min_gain_shift) {
+                        local_gain = current_gain - min_gain_shift;
+                        threshold_value = task.num_bin - 2u - tid;
+                        threshold_found = true;
+                        best_left_gradient = sum_left_gradient;
+                        best_left_hessian = sum_left_hessian;
+                        best_left_count = left_count;
+                    }
+                }
             }
-            const float grad = hist[t << 1];
-            const float hess = hist[(t << 1) + 1];
-            const int cnt = static_cast<int>(rint(hess * cnt_factor));
-            sum_right_gradient += grad;
-            sum_right_hessian += hess;
-            right_count += cnt;
-
-            if (right_count < min_data_in_leaf ||
-                sum_right_hessian < min_sum_hessian_in_leaf) {
-                continue;
-            }
-
-            const int left_count = total_count - right_count;
-            if (left_count < min_data_in_leaf) {
-                break;
-            }
-
-            const float sum_left_hessian = total_hessian - sum_right_hessian;
-            if (sum_left_hessian < min_sum_hessian_in_leaf) {
-                break;
-            }
-
-            const float sum_left_gradient = total_gradient - sum_right_gradient;
-            const float current_gain = metal_split_gain(
-                sum_left_gradient, sum_left_hessian,
-                sum_right_gradient, sum_right_hessian,
-                lambda_l1, lambda_l2);
-            if (current_gain <= min_gain_shift) {
-                continue;
-            }
-            if (current_gain > best_gain) {
-                best_gain = current_gain;
-                best_left_gradient = sum_left_gradient;
-                best_left_hessian = sum_left_hessian;
-                best_left_count = left_count;
-                best_threshold = static_cast<uint>(t - 1 + offset);
-            }
-        }
-    } else {
-        float sum_left_gradient = 0.0f;
-        float sum_left_hessian = kMetalSplitEpsilon;
-        int left_count = 0;
-
-        int t = 0;
-        const int t_end = static_cast<int>(task.num_bin) - 2 - offset;
-        if (task.na_as_missing && offset == 1) {
-            sum_left_gradient = total_gradient;
-            sum_left_hessian = total_hessian - kMetalSplitEpsilon;
-            left_count = total_count;
-            for (uint i = 0; i < task.num_bin - task.mfb_offset; ++i) {
-                const float grad = hist[i << 1];
-                const float hess = hist[(i << 1) + 1];
-                const int cnt = static_cast<int>(rint(hess * cnt_factor));
-                sum_left_gradient -= grad;
-                sum_left_hessian -= hess;
-                left_count -= cnt;
-            }
-            t = -1;
-        }
-
-        for (; t <= t_end; ++t) {
-            if (task.skip_default_bin &&
-                (t + offset) == static_cast<int>(task.default_bin)) {
-                continue;
-            }
-            if (t >= 0) {
-                const float grad = hist[t << 1];
-                const float hess = hist[(t << 1) + 1];
-                sum_left_gradient += grad;
-                sum_left_hessian += hess;
-                left_count += static_cast<int>(rint(hess * cnt_factor));
-            }
-
-            if (left_count < min_data_in_leaf ||
-                sum_left_hessian < min_sum_hessian_in_leaf) {
-                continue;
-            }
-
-            const int right_count = total_count - left_count;
-            if (right_count < min_data_in_leaf) {
-                break;
-            }
-
-            const float sum_right_hessian = total_hessian - sum_left_hessian;
-            if (sum_right_hessian < min_sum_hessian_in_leaf) {
-                break;
-            }
-
-            const float sum_right_gradient = total_gradient - sum_left_gradient;
-            const float current_gain = metal_split_gain(
-                sum_left_gradient, sum_left_hessian,
-                sum_right_gradient, sum_right_hessian,
-                lambda_l1, lambda_l2);
-            if (current_gain <= min_gain_shift) {
-                continue;
-            }
-            if (current_gain > best_gain) {
-                best_gain = current_gain;
-                best_left_gradient = sum_left_gradient;
-                best_left_hessian = sum_left_hessian;
-                best_left_count = left_count;
-                best_threshold = static_cast<uint>(t + offset);
+        } else {
+            const uint end = (task.na_as_missing != 0 && offset == 1u)
+                ? (task.num_bin - 2u)
+                : (feature_num_bin_minus_offset - 2u);
+            if (tid <= end && !skip_sum) {
+                const float sum_left_gradient = grad_scan[tid];
+                const float sum_left_hessian = hess_scan[tid];
+                const int left_count = static_cast<int>(rint(sum_left_hessian * cnt_factor));
+                const float sum_right_gradient = total_gradient - sum_left_gradient;
+                const float sum_right_hessian = total_hessian - sum_left_hessian;
+                const int right_count = total_count - left_count;
+                if (sum_left_hessian >= min_sum_hessian_in_leaf &&
+                    left_count >= min_data_in_leaf &&
+                    sum_right_hessian >= min_sum_hessian_in_leaf &&
+                    right_count >= min_data_in_leaf) {
+                    const float current_gain = metal_split_gain(
+                        sum_left_gradient, sum_left_hessian,
+                        sum_right_gradient, sum_right_hessian,
+                        lambda_l1, lambda_l2);
+                    if (current_gain > min_gain_shift) {
+                        local_gain = current_gain - min_gain_shift;
+                        threshold_value = (task.na_as_missing != 0 && offset == 1u)
+                            ? tid
+                            : (tid + offset);
+                        threshold_found = true;
+                        best_left_gradient = sum_left_gradient;
+                        best_left_hessian = sum_left_hessian;
+                        best_left_count = left_count;
+                    }
+                }
             }
         }
     }
 
-    if (best_gain == kMetalSplitMinScore) {
+    gain_scan[tid] = local_gain;
+    best_index_scan[tid] = tid;
+    valid_scan[tid] = threshold_found ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const bool self_valid = valid_scan[tid] != 0;
+            const bool other_valid = valid_scan[tid + stride] != 0;
+            if ((!self_valid && other_valid) ||
+                (self_valid && other_valid &&
+                 (gain_scan[tid + stride] > gain_scan[tid] ||
+                  (gain_scan[tid + stride] == gain_scan[tid] &&
+                   best_index_scan[tid + stride] < best_index_scan[tid])))) {
+                gain_scan[tid] = gain_scan[tid + stride];
+                best_index_scan[tid] = best_index_scan[tid + stride];
+                valid_scan[tid] = valid_scan[tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (valid_scan[0] == 0u) {
         return;
     }
 
-    const float final_left_hessian = best_left_hessian - kMetalSplitEpsilon;
-    const float final_right_gradient = total_gradient - best_left_gradient;
-    const float final_right_hessian = total_hessian - best_left_hessian - kMetalSplitEpsilon;
-
-    out.gain = best_gain - min_gain_shift;
-    out.feature = task.inner_feature_index;
-    out.threshold = best_threshold;
-    out.default_left = task.assume_out_default_left;
-    out.left_sum_gradient = best_left_gradient;
-    out.left_sum_hessian = final_left_hessian;
-    out.left_count = best_left_count;
-    out.right_sum_gradient = final_right_gradient;
-    out.right_sum_hessian = final_right_hessian;
-    out.right_count = total_count - best_left_count;
-    out.left_value = metal_leaf_output(best_left_gradient, final_left_hessian,
-                                       lambda_l1, lambda_l2);
-    out.right_value = metal_leaf_output(final_right_gradient, final_right_hessian,
-                                        lambda_l1, lambda_l2);
-    out.found = 1;
+    const uint winning_tid = best_index_scan[0];
+    if (tid == winning_tid && threshold_found) {
+        const float final_left_hessian = best_left_hessian - kMetalSplitEpsilon;
+        const float final_right_gradient = total_gradient - best_left_gradient;
+        const float final_right_hessian =
+            total_hessian - best_left_hessian - kMetalSplitEpsilon;
+        out.gain = local_gain;
+        out.feature = task.inner_feature_index;
+        out.threshold = threshold_value;
+        out.default_left = task.assume_out_default_left;
+        out.left_sum_gradient = best_left_gradient;
+        out.left_sum_hessian = final_left_hessian;
+        out.left_count = best_left_count;
+        out.right_sum_gradient = final_right_gradient;
+        out.right_sum_hessian = final_right_hessian;
+        out.right_count = total_count - best_left_count;
+        out.left_value = metal_leaf_output(best_left_gradient, final_left_hessian,
+                                           lambda_l1, lambda_l2);
+        out.right_value = metal_leaf_output(final_right_gradient, final_right_hessian,
+                                            lambda_l1, lambda_l2);
+        out.found = 1;
+    }
 }

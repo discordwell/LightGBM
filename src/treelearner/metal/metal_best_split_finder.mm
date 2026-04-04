@@ -156,9 +156,9 @@ void MetalBestSplitFinder::InitTasks() {
 void MetalBestSplitFinder::Init() {
   InitTasks();
   is_feature_used_buf_.Resize(static_cast<size_t>(num_features_));
-  per_task_result_buf_.Resize(static_cast<size_t>(num_tasks_));
+  per_task_result_buf_.Resize(static_cast<size_t>(num_tasks_) * kHistSlots);
   per_leaf_best_buf_.Resize(static_cast<size_t>(num_leaves_));
-  histogram_input_buf_.Resize(static_cast<size_t>(num_total_bin_) * 2 * 2);
+  histogram_input_buf_.Resize(static_cast<size_t>(num_total_bin_) * 2 * kHistSlots);
   find_best_split_pso_ = MetalDevice::GetPipeline("find_best_split_numeric");
 }
 
@@ -199,27 +199,12 @@ void MetalBestSplitFinder::UploadHistogram(const hist_t* src_hist, size_t slot) 
   }
 }
 
-void MetalBestSplitFinder::DispatchSplitKernel(
-    const MetalLeafSplitsStruct* leaf_splits,
-    int leaf_index,
-    size_t hist_slot,
-    const std::vector<int8_t>& node_feature_mask) {
-  if (leaf_index < 0 || leaf_splits == nullptr ||
-      leaf_splits->num_data_in_leaf <= min_data_in_leaf_ ||
-      leaf_splits->sum_of_hessians <= min_sum_hessian_in_leaf_) {
-    ClearLeafBest(leaf_index);
-    return;
-  }
-
-  const float total_grad =
-      static_cast<float>(leaf_splits->sum_of_gradients);
-  const float total_hess =
-      static_cast<float>(leaf_splits->sum_of_hessians);
-  const uint32_t total_count =
-      static_cast<uint32_t>(leaf_splits->num_data_in_leaf);
-  const float parent_gain = static_cast<float>(
-      CalcLeafGain(leaf_splits->sum_of_gradients,
-                   leaf_splits->sum_of_hessians, lambda_l1_, lambda_l2_));
+void MetalBestSplitFinder::DispatchSplitKernels(
+    const MetalLeafSplitsStruct* const* leaf_splits,
+    const int* leaf_indices,
+    const std::vector<int8_t>* const* node_feature_masks,
+    void* const* histogram_buffers,
+    const size_t* histogram_offsets) {
   const float lambda_l1 = static_cast<float>(lambda_l1_);
   const float lambda_l2 = static_cast<float>(lambda_l2_);
   const float min_gain_to_split = static_cast<float>(min_gain_to_split_);
@@ -227,8 +212,6 @@ void MetalBestSplitFinder::DispatchSplitKernel(
   const float min_sum_hessian_in_leaf =
       static_cast<float>(min_sum_hessian_in_leaf_);
   const uint32_t num_tasks = static_cast<uint32_t>(num_tasks_);
-  const size_t hist_offset =
-      hist_slot * static_cast<size_t>(num_total_bin_) * 2 * sizeof(float);
 
   @autoreleasepool {
     id<MTLCommandQueue> queue =
@@ -237,6 +220,8 @@ void MetalBestSplitFinder::DispatchSplitKernel(
     id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
     id<MTLComputePipelineState> pso =
         (__bridge id<MTLComputePipelineState>)find_best_split_pso_;
+    METAL_CHECK([pso maxTotalThreadsPerThreadgroup] >= 256,
+                "find_best_split_numeric requires 256 threads per threadgroup");
 
     [encoder setComputePipelineState:pso];
     [encoder setBuffer:(__bridge id<MTLBuffer>)tasks_buf_.GetMTLBuffer()
@@ -246,25 +231,57 @@ void MetalBestSplitFinder::DispatchSplitKernel(
     [encoder setBuffer:(__bridge id<MTLBuffer>)is_feature_used_buf_.GetMTLBuffer()
                 offset:0
                atIndex:2];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)histogram_input_buf_.GetMTLBuffer()
-                offset:hist_offset
-               atIndex:3];
-    [encoder setBytes:&total_grad length:sizeof(total_grad) atIndex:4];
-    [encoder setBytes:&total_hess length:sizeof(total_hess) atIndex:5];
-    [encoder setBytes:&total_count length:sizeof(total_count) atIndex:6];
-    [encoder setBytes:&parent_gain length:sizeof(parent_gain) atIndex:7];
     [encoder setBytes:&lambda_l1 length:sizeof(lambda_l1) atIndex:8];
     [encoder setBytes:&lambda_l2 length:sizeof(lambda_l2) atIndex:9];
-    [encoder setBytes:&min_gain_to_split length:sizeof(min_gain_to_split) atIndex:10];
-    [encoder setBytes:&min_data_in_leaf length:sizeof(min_data_in_leaf) atIndex:11];
+    [encoder setBytes:&min_gain_to_split length:sizeof(min_gain_to_split)
+               atIndex:10];
+    [encoder setBytes:&min_data_in_leaf length:sizeof(min_data_in_leaf)
+               atIndex:11];
     [encoder setBytes:&min_sum_hessian_in_leaf
                 length:sizeof(min_sum_hessian_in_leaf)
                atIndex:12];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)per_task_result_buf_.GetMTLBuffer()
-                offset:0
-               atIndex:13];
-    [encoder dispatchThreadgroups:MTLSizeMake(num_tasks_, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+
+    for (size_t slot = 0; slot < kHistSlots; ++slot) {
+      const MetalLeafSplitsStruct* leaf = leaf_splits[slot];
+      const int leaf_index = leaf_indices[slot];
+      const std::vector<int8_t>* node_feature_mask = node_feature_masks[slot];
+      if (leaf_index < 0 || leaf == nullptr || node_feature_mask == nullptr ||
+          leaf->num_data_in_leaf <= min_data_in_leaf_ ||
+          leaf->sum_of_hessians <= min_sum_hessian_in_leaf_) {
+        ClearLeafBest(leaf_index);
+        continue;
+      }
+
+      const float total_grad = static_cast<float>(leaf->sum_of_gradients);
+      const float total_hess = static_cast<float>(leaf->sum_of_hessians);
+      const uint32_t total_count = static_cast<uint32_t>(leaf->num_data_in_leaf);
+      const float parent_gain = static_cast<float>(
+          CalcLeafGain(leaf->sum_of_gradients, leaf->sum_of_hessians,
+                       lambda_l1_, lambda_l2_));
+      void* hist_buffer = histogram_buffers[slot];
+      size_t hist_offset = histogram_offsets[slot];
+      if (hist_buffer == nullptr) {
+        hist_buffer = histogram_input_buf_.GetMTLBuffer();
+        hist_offset =
+            slot * static_cast<size_t>(num_total_bin_) * 2 * sizeof(float);
+      }
+      const size_t result_offset =
+          slot * static_cast<size_t>(num_tasks_) * sizeof(MetalSplitResult);
+
+      [encoder setBuffer:(__bridge id<MTLBuffer>)hist_buffer
+                  offset:hist_offset
+                 atIndex:3];
+      [encoder setBytes:&total_grad length:sizeof(total_grad) atIndex:4];
+      [encoder setBytes:&total_hess length:sizeof(total_hess) atIndex:5];
+      [encoder setBytes:&total_count length:sizeof(total_count) atIndex:6];
+      [encoder setBytes:&parent_gain length:sizeof(parent_gain) atIndex:7];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)per_task_result_buf_.GetMTLBuffer()
+                  offset:result_offset
+                 atIndex:13];
+      [encoder dispatchThreadgroups:MTLSizeMake(num_tasks_, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
     [encoder endEncoding];
     [cmd_buf commit];
     [cmd_buf waitUntilCompleted];
@@ -272,12 +289,31 @@ void MetalBestSplitFinder::DispatchSplitKernel(
                 [[[cmd_buf error] localizedDescription] UTF8String]);
   }
 
+    for (size_t slot = 0; slot < kHistSlots; ++slot) {
+      const int leaf_index = leaf_indices[slot];
+      const MetalLeafSplitsStruct* leaf = leaf_splits[slot];
+      const std::vector<int8_t>* node_feature_mask = node_feature_masks[slot];
+    if (leaf_index < 0 || leaf == nullptr || node_feature_mask == nullptr ||
+        leaf->num_data_in_leaf <= min_data_in_leaf_ ||
+        leaf->sum_of_hessians <= min_sum_hessian_in_leaf_) {
+      ClearLeafBest(leaf_index);
+      continue;
+    }
+    ReduceBestFromTaskResults(leaf_index, slot, *node_feature_mask);
+  }
+}
+
+void MetalBestSplitFinder::ReduceBestFromTaskResults(
+    int leaf_index,
+    size_t result_slot,
+    const std::vector<int8_t>& node_feature_mask) {
   MetalSplitResult best{};
   best.gain = -std::numeric_limits<float>::infinity();
   best.feature = -1;
   best.found = 0;
 
-  const MetalSplitResult* results = per_task_result_buf_.data();
+  const MetalSplitResult* results =
+      per_task_result_buf_.data() + result_slot * static_cast<size_t>(num_tasks_);
   for (int t = 0; t < num_tasks_; ++t) {
     const MetalSplitResult& candidate = results[t];
     if (!candidate.found) {
@@ -299,29 +335,54 @@ void MetalBestSplitFinder::DispatchSplitKernel(
 
 void MetalBestSplitFinder::FindBestSplitsForLeaf(
     const hist_t* smaller_leaf_hist,
+    void* smaller_leaf_hist_buffer,
+    size_t smaller_leaf_hist_buffer_offset,
     const MetalLeafSplitsStruct* smaller_leaf_splits,
     int smaller_leaf_index,
     const std::vector<int8_t>& smaller_node_used_features,
     const hist_t* larger_leaf_hist,
+    void* larger_leaf_hist_buffer,
+    size_t larger_leaf_hist_buffer_offset,
     const MetalLeafSplitsStruct* larger_leaf_splits,
     int larger_leaf_index,
     const std::vector<int8_t>* larger_node_used_features) {
+  const MetalLeafSplitsStruct* leaf_splits[kHistSlots] = {nullptr, nullptr};
+  const std::vector<int8_t>* node_feature_masks[kHistSlots] = {nullptr, nullptr};
+  int leaf_indices[kHistSlots] = {-1, -1};
+  void* histogram_buffers[kHistSlots] = {nullptr, nullptr};
+  size_t histogram_offsets[kHistSlots] = {0, 0};
+
   if (smaller_leaf_hist != nullptr && smaller_leaf_splits != nullptr) {
-    UploadHistogram(smaller_leaf_hist, 0);
-    DispatchSplitKernel(smaller_leaf_splits, smaller_leaf_index, 0,
-                        smaller_node_used_features);
+    if (smaller_leaf_hist_buffer != nullptr) {
+      histogram_buffers[0] = smaller_leaf_hist_buffer;
+      histogram_offsets[0] = smaller_leaf_hist_buffer_offset;
+    } else {
+      UploadHistogram(smaller_leaf_hist, 0);
+    }
+    leaf_splits[0] = smaller_leaf_splits;
+    node_feature_masks[0] = &smaller_node_used_features;
+    leaf_indices[0] = smaller_leaf_index;
   } else {
     ClearLeafBest(smaller_leaf_index);
   }
 
   if (larger_leaf_index >= 0 && larger_leaf_hist != nullptr &&
       larger_leaf_splits != nullptr && larger_node_used_features != nullptr) {
-    UploadHistogram(larger_leaf_hist, 1);
-    DispatchSplitKernel(larger_leaf_splits, larger_leaf_index, 1,
-                        *larger_node_used_features);
+    if (larger_leaf_hist_buffer != nullptr) {
+      histogram_buffers[1] = larger_leaf_hist_buffer;
+      histogram_offsets[1] = larger_leaf_hist_buffer_offset;
+    } else {
+      UploadHistogram(larger_leaf_hist, 1);
+    }
+    leaf_splits[1] = larger_leaf_splits;
+    node_feature_masks[1] = larger_node_used_features;
+    leaf_indices[1] = larger_leaf_index;
   } else {
     ClearLeafBest(larger_leaf_index);
   }
+
+  DispatchSplitKernels(leaf_splits, leaf_indices, node_feature_masks,
+                       histogram_buffers, histogram_offsets);
 }
 
 void MetalBestSplitFinder::GetBestSplitForLeaf(
@@ -397,9 +458,9 @@ void MetalBestSplitFinder::ResetTrainingData(
   InitFeatureMetaInfo(train_data);
   InitTasks();
   is_feature_used_buf_.Resize(static_cast<size_t>(num_features_));
-  per_task_result_buf_.Resize(static_cast<size_t>(num_tasks_));
+  per_task_result_buf_.Resize(static_cast<size_t>(num_tasks_) * kHistSlots);
   per_leaf_best_buf_.Resize(static_cast<size_t>(num_leaves_));
-  histogram_input_buf_.Resize(static_cast<size_t>(num_total_bin_) * 2 * 2);
+  histogram_input_buf_.Resize(static_cast<size_t>(num_total_bin_) * 2 * kHistSlots);
 }
 
 void MetalBestSplitFinder::ResetConfig(const Config* config) {

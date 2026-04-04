@@ -57,6 +57,8 @@ MetalSingleGPUTreeLearner::~MetalSingleGPUTreeLearner() {
     release(partition_output_buffer_);
     release(partition_counts_buffer_);
     release(histogram_output_buffer_);
+    release(leaf_hist_parent_buffer_);
+    release(leaf_hist_cache_buffer_);
     release(data_indices_buffer_);
     release(hessians_buffer_);
     release(gradients_buffer_);
@@ -333,6 +335,8 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     const std::vector<int8_t>& is_feature_used, bool use_subtract) {
   Common::FunctionTimer fun_timer(
       "MetalSingleGPUTreeLearner::ConstructHistograms", global_timer);
+  const bool enable_gpu_split =
+      std::getenv("LIGHTGBM_METAL_DISABLE_GPU_SPLIT") == nullptr;
   const bool stage_timing =
       std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
   auto stage_start = std::chrono::steady_clock::now();
@@ -365,6 +369,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     @autoreleasepool {
       id<MTLDevice> dev = (__bridge id<MTLDevice>)metal_device_;
       const size_t pack_size = static_cast<size_t>(num_data_) * num_groups;
+      leaf_hist_num_items_ = static_cast<size_t>(total_bins) * 2;
       auto replace = [](void*& ptr, id obj) {
         if (ptr) {
           CFRelease(ptr);
@@ -540,6 +545,18 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       replace(histogram_output_buffer_,
               [dev newBufferWithLength:total_bins * 2 * sizeof(float)
                                options:MTLResourceStorageModeShared]);
+      replace(leaf_hist_cache_buffer_,
+              [dev newBufferWithLength:static_cast<size_t>(config_->num_leaves) *
+                                       leaf_hist_num_items_ * sizeof(float)
+                               options:MTLResourceStorageModeShared]);
+      replace(leaf_hist_parent_buffer_,
+              [dev newBufferWithLength:leaf_hist_num_items_ * sizeof(float)
+                               options:MTLResourceStorageModeShared]);
+      std::memset([(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents], 0,
+                  static_cast<size_t>(config_->num_leaves) *
+                  leaf_hist_num_items_ * sizeof(float));
+      std::memset([(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents], 0,
+                  leaf_hist_num_items_ * sizeof(float));
     }
     bin_data_packed_ = true;
   }
@@ -547,14 +564,42 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
 
   // --- Dispatch ---
   @autoreleasepool {
+    const bool use_cached_hist_output =
+        enable_gpu_split && leaf_hist_cache_buffer_ != nullptr &&
+        smaller_leaf != nullptr && smaller_leaf->leaf_index >= 0 &&
+        leaf_hist_num_items_ > 0;
+    const size_t hist_output_offset =
+        use_cached_hist_output
+            ? static_cast<size_t>(smaller_leaf->leaf_index) *
+                  leaf_hist_num_items_ * sizeof(float)
+            : 0;
+    if (use_cached_hist_output && use_subtract && larger_leaf != nullptr &&
+        larger_leaf->leaf_index >= 0) {
+      const int parent_leaf_index =
+          std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
+      if (parent_leaf_index == smaller_leaf->leaf_index) {
+        const float* leaf_hist_cache =
+            reinterpret_cast<const float*>(
+                [(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
+        std::memcpy([(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents],
+                    leaf_hist_cache +
+                        static_cast<size_t>(smaller_leaf->leaf_index) *
+                            leaf_hist_num_items_,
+                    leaf_hist_num_items_ * sizeof(float));
+      }
+    }
+
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal_queue_;
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
 
     // Zero histogram
-    id<MTLBuffer> histBuf = (__bridge id<MTLBuffer>)histogram_output_buffer_;
+    id<MTLBuffer> histBuf =
+        use_cached_hist_output
+            ? (__bridge id<MTLBuffer>)leaf_hist_cache_buffer_
+            : (__bridge id<MTLBuffer>)histogram_output_buffer_;
     id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
     [blit fillBuffer:histBuf
-               range:NSMakeRange(0, total_bins * 2 * sizeof(float))
+               range:NSMakeRange(hist_output_offset, total_bins * 2 * sizeof(float))
                value:0];
     [blit endEncoding];
 
@@ -627,7 +672,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       [enc3 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:0];
       [enc3 setBuffer:(__bridge id<MTLBuffer>)dense_group_map_buffer_ offset:0 atIndex:1];
       [enc3 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:2];
-      [enc3 setBuffer:histBuf offset:0 atIndex:3];
+      [enc3 setBuffer:histBuf offset:hist_output_offset atIndex:3];
       [enc3 setBytes:&nt length:sizeof(uint32_t) atIndex:4];
       [enc3 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:5];
       NSUInteger tg3 = std::min(256u, (uint32_t)[rPso maxTotalThreadsPerThreadgroup]);
@@ -646,7 +691,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_col_buffer_ offset:0 atIndex:2];
       [enc setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:3];
       [enc setBuffer:idx_buf offset:0 atIndex:4];
-      [enc setBuffer:histBuf offset:0 atIndex:5];
+      [enc setBuffer:histBuf offset:hist_output_offset atIndex:5];
       uint32_t nd = static_cast<uint32_t>(num_data_in_leaf);
       uint32_t ng = static_cast<uint32_t>(num_groups);
       uint32_t tb = static_cast<uint32_t>(total_bins);
@@ -667,17 +712,59 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     [cmdBuf waitUntilCompleted];
     log_stage("histogram/gpu_wait");
 
-    // Convert float → double
-    const float* hist_float = reinterpret_cast<const float*>([histBuf contents]);
-    for (int g = 0; g < num_groups; ++g) {
-      if (train_data_->IsMultiGroup(g)) continue;
-      const int start = train_data_->GroupBinBoundary(g);
-      const int nbins = train_data_->GroupBinBoundary(g + 1) - start;
-      hist_t* dst = ptr_smaller_leaf_hist_data + start * 2;
-      const float* src = hist_float + start * 2;
-      for (int b = 0; b < nbins; ++b) {
-        dst[b * 2]     = static_cast<hist_t>(src[b * 2]);
-        dst[b * 2 + 1] = static_cast<hist_t>(src[b * 2 + 1]);
+    if (leaf_hist_cache_buffer_ != nullptr && smaller_leaf != nullptr &&
+        smaller_leaf->leaf_index >= 0 && leaf_hist_num_items_ > 0) {
+      float* leaf_hist_cache =
+          reinterpret_cast<float*>([(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
+      float* hist_float = reinterpret_cast<float*>([histBuf contents]) +
+          hist_output_offset / sizeof(float);
+      const size_t smaller_hist_offset =
+          static_cast<size_t>(smaller_leaf->leaf_index) * leaf_hist_num_items_;
+      if (!use_cached_hist_output && use_subtract && larger_leaf != nullptr &&
+          larger_leaf->leaf_index >= 0) {
+        const int parent_leaf_index =
+            std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
+        if (parent_leaf_index == smaller_leaf->leaf_index) {
+          std::memcpy([(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents],
+                      leaf_hist_cache + smaller_hist_offset,
+                      leaf_hist_num_items_ * sizeof(float));
+        }
+      }
+      if (!use_cached_hist_output) {
+        std::memcpy(leaf_hist_cache + smaller_hist_offset, hist_float,
+                    leaf_hist_num_items_ * sizeof(float));
+      }
+      if (use_subtract && larger_leaf != nullptr && larger_leaf->leaf_index >= 0) {
+        const int parent_leaf_index =
+            std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
+        const float* parent_hist =
+            parent_leaf_index == smaller_leaf->leaf_index
+                ? reinterpret_cast<const float*>(
+                      [(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents])
+                : leaf_hist_cache + static_cast<size_t>(parent_leaf_index) * leaf_hist_num_items_;
+        float* larger_hist =
+            leaf_hist_cache + static_cast<size_t>(larger_leaf->leaf_index) * leaf_hist_num_items_;
+        for (size_t i = 0; i < leaf_hist_num_items_; ++i) {
+          larger_hist[i] = parent_hist[i] - hist_float[i];
+        }
+      }
+    }
+
+    if (!enable_gpu_split) {
+      // Legacy CPU split search still needs the full smaller-leaf histogram.
+      const float* hist_float =
+          reinterpret_cast<const float*>([histBuf contents]) +
+          hist_output_offset / sizeof(float);
+      for (int g = 0; g < num_groups; ++g) {
+        if (train_data_->IsMultiGroup(g)) continue;
+        const int start = train_data_->GroupBinBoundary(g);
+        const int nbins = train_data_->GroupBinBoundary(g + 1) - start;
+        hist_t* dst = ptr_smaller_leaf_hist_data + start * 2;
+        const float* src = hist_float + start * 2;
+        for (int b = 0; b < nbins; ++b) {
+          dst[b * 2]     = static_cast<hist_t>(src[b * 2]);
+          dst[b * 2 + 1] = static_cast<hist_t>(src[b * 2 + 1]);
+        }
       }
     }
     log_stage("histogram/copyout");
@@ -704,7 +791,6 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
   Common::FunctionTimer fun_timer(
       "MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms", global_timer);
   const bool enable_gpu_split =
-      std::getenv("LIGHTGBM_METAL_ENABLE_GPU_SPLIT") != nullptr &&
       std::getenv("LIGHTGBM_METAL_DISABLE_GPU_SPLIT") == nullptr;
   if (!enable_gpu_split) {
     SerialTreeLearner::FindBestSplitsFromHistograms(is_feature_used, use_subtract,
@@ -746,16 +832,35 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
   if (larger_leaf_histogram_array_ != nullptr) {
     larger_hist = larger_leaf_histogram_array_[0].RawData() - kHistOffset;
   }
-
-  if (use_subtract && larger_hist != nullptr) {
+  void* smaller_hist_buffer = histogram_output_buffer_;
+  size_t smaller_hist_buffer_offset = 0;
+  void* larger_hist_buffer = nullptr;
+  size_t larger_hist_buffer_offset = 0;
+  if (leaf_hist_cache_buffer_ != nullptr && leaf_hist_num_items_ > 0 &&
+      smaller_leaf_index >= 0) {
+    const size_t hist_bytes_per_leaf = leaf_hist_num_items_ * sizeof(float);
+    smaller_hist_buffer = leaf_hist_cache_buffer_;
+    smaller_hist_buffer_offset =
+        static_cast<size_t>(smaller_leaf_index) * hist_bytes_per_leaf;
+    if (use_subtract && larger_leaf_index >= 0) {
+      larger_hist_buffer = leaf_hist_cache_buffer_;
+      larger_hist_buffer_offset =
+          static_cast<size_t>(larger_leaf_index) * hist_bytes_per_leaf;
+    }
+  }
+  const bool use_cached_smaller_hist =
+      smaller_hist_buffer == leaf_hist_cache_buffer_;
+  const bool use_cached_larger_hist =
+      larger_hist_buffer == leaf_hist_cache_buffer_;
+  if (use_subtract && larger_hist != nullptr && larger_hist_buffer == nullptr) {
     Common::FunctionTimer subtract_timer(
         "MetalSingleGPUTreeLearner::SubtractHistograms", global_timer);
     for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
       if (!is_feature_used[feature_index]) {
         continue;
       }
-        larger_leaf_histogram_array_[feature_index].Subtract<false>(
-            smaller_leaf_histogram_array_[feature_index]);
+      larger_leaf_histogram_array_[feature_index].Subtract<false>(
+          smaller_leaf_histogram_array_[feature_index]);
     }
   }
   log_stage("split/subtract");
@@ -763,19 +868,64 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
   CHECK(best_split_finder_ != nullptr);
   best_split_finder_->FindBestSplitsForLeaf(
       smaller_hist,
+      smaller_hist_buffer,
+      smaller_hist_buffer_offset,
       smaller_leaf,
       smaller_leaf_index,
       smaller_node_used_features,
       larger_hist,
+      larger_hist_buffer,
+      larger_hist_buffer_offset,
       larger_leaf,
       larger_leaf_index,
       larger_leaf_index >= 0 ? &larger_node_used_features : nullptr);
   log_stage("split/gpu_search");
 
+  const auto materialize_feature_from_cache =
+      [&](int leaf_index, int feature_index, FeatureHistogram* hist_array) {
+        if (leaf_hist_cache_buffer_ == nullptr || leaf_hist_num_items_ == 0 ||
+            leaf_index < 0 || feature_index < 0 || hist_array == nullptr) {
+          return;
+        }
+        const float* leaf_hist_cache =
+            reinterpret_cast<const float*>(
+                [(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
+        const size_t hist_offset =
+            static_cast<size_t>(leaf_index) * leaf_hist_num_items_;
+        const int start = share_state_->feature_hist_offsets()[feature_index];
+        const int num_bin = train_data_->FeatureNumBin(feature_index);
+        const float* src = leaf_hist_cache + hist_offset + start * 2;
+        hist_t* dst = hist_array[feature_index].RawData();
+        for (int bin = 0; bin < num_bin; ++bin) {
+          dst[bin * 2] = static_cast<hist_t>(src[bin * 2]);
+          dst[bin * 2 + 1] = static_cast<hist_t>(src[bin * 2 + 1]);
+        }
+      };
+
+  const auto materialize_leaf_from_cache =
+      [&](int leaf_index, FeatureHistogram* hist_array,
+          const std::vector<int8_t>& node_used_features) {
+        if (leaf_hist_cache_buffer_ == nullptr || leaf_hist_num_items_ == 0 ||
+            leaf_index < 0 || hist_array == nullptr) {
+          return;
+        }
+        for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
+          if (!is_feature_used[feature_index] ||
+              !node_used_features[feature_index]) {
+            continue;
+          }
+          materialize_feature_from_cache(leaf_index, feature_index, hist_array);
+        }
+      };
+
   auto recompute_leaf_on_cpu =
       [&](int leaf_index, LeafSplits* leaf_splits, FeatureHistogram* hist_array,
           const std::vector<int8_t>& node_used_features,
           double parent_output) {
+        if ((leaf_index == smaller_leaf_index && use_cached_smaller_hist) ||
+            (leaf_index == larger_leaf_index && use_cached_larger_hist)) {
+          materialize_leaf_from_cache(leaf_index, hist_array, node_used_features);
+        }
         std::vector<SplitInfo> thread_best(share_state_->num_threads);
         OMP_INIT_EX();
 #pragma omp parallel for schedule(static) num_threads(share_state_->num_threads)
@@ -805,6 +955,10 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
         if (split.feature < 0 || split.gain <= kMinScore ||
             !node_used_features[split.feature]) {
           return;
+        }
+        if ((leaf_index == smaller_leaf_index && use_cached_smaller_hist) ||
+            (leaf_index == larger_leaf_index && use_cached_larger_hist)) {
+          materialize_feature_from_cache(leaf_index, split.feature, hist_array);
         }
 
         SplitInfo refined;
