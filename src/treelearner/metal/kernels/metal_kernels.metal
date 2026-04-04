@@ -345,6 +345,21 @@ kernel void reduce_histogram_packed_subhist(
 }
 
 // ===========================================================================
+// subtract_histograms — elementwise larger = parent - smaller
+// ===========================================================================
+
+kernel void subtract_histograms(
+    const device float* parent_hist [[buffer(0)]],
+    const device float* smaller_hist [[buffer(1)]],
+    device float* larger_hist [[buffer(2)]],
+    constant uint& num_items [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= num_items) return;
+    larger_hist[gid] = parent_hist[gid] - smaller_hist[gid];
+}
+
+// ===========================================================================
 // histogram_private — ZERO atomics, private histogram per thread
 //
 // The key insight: 32KB threadgroup memory fits 16 private histograms

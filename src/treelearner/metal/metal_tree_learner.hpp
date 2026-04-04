@@ -88,6 +88,7 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void* packed_histogram_pipeline_ = nullptr;  // packed-tuple histogram kernel
   void* packed_reduction_pipeline_ = nullptr;  // packed-tuple reduction kernel
   void* packed_gather_pipeline_ = nullptr;     // packed-tuple gather kernel
+  void* histogram_subtract_pipeline_ = nullptr;  // cached parent-smaller subtraction
   void* partition_pipeline_ = nullptr;         // numerical partition kernel
 
   // Metal buffers

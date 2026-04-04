@@ -68,6 +68,7 @@ MetalSingleGPUTreeLearner::~MetalSingleGPUTreeLearner() {
     release(dense_group_map_buffer_);
     release(group_offsets_buffer_);
     release(partition_pipeline_);
+    release(histogram_subtract_pipeline_);
     release(packed_gather_pipeline_);
     release(packed_reduction_pipeline_);
     release(packed_histogram_pipeline_);
@@ -469,6 +470,16 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
         replace(partition_pipeline_, pso);
       }
 
+      {
+        id<MTLFunction> func = [lib newFunctionWithName:@"subtract_histograms"];
+        METAL_CHECK(func != nil, "subtract_histograms kernel not found");
+        error = nil;
+        id<MTLComputePipelineState> pso =
+            [dev newComputePipelineStateWithFunction:func error:&error];
+        METAL_CHECK(pso != nil, "Failed to create histogram subtract pipeline");
+        replace(histogram_subtract_pipeline_, pso);
+      }
+
       if (use_row_parallel_) {
         id<MTLFunction> func = [lib newFunctionWithName:@"histogram_gathered_subhist"];
         METAL_CHECK(func != nil, "histogram_gathered_subhist kernel not found");
@@ -573,21 +584,11 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
             ? static_cast<size_t>(smaller_leaf->leaf_index) *
                   leaf_hist_num_items_ * sizeof(float)
             : 0;
-    if (use_cached_hist_output && use_subtract && larger_leaf != nullptr &&
-        larger_leaf->leaf_index >= 0) {
-      const int parent_leaf_index =
-          std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
-      if (parent_leaf_index == smaller_leaf->leaf_index) {
-        const float* leaf_hist_cache =
-            reinterpret_cast<const float*>(
-                [(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
-        std::memcpy([(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents],
-                    leaf_hist_cache +
-                        static_cast<size_t>(smaller_leaf->leaf_index) *
-                            leaf_hist_num_items_,
-                    leaf_hist_num_items_ * sizeof(float));
-      }
-    }
+    const bool needs_parent_preserve =
+        use_cached_hist_output && use_subtract && larger_leaf != nullptr &&
+        larger_leaf->leaf_index >= 0 &&
+        std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index) ==
+            smaller_leaf->leaf_index;
 
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)metal_queue_;
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
@@ -598,6 +599,13 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
             ? (__bridge id<MTLBuffer>)leaf_hist_cache_buffer_
             : (__bridge id<MTLBuffer>)histogram_output_buffer_;
     id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+    if (needs_parent_preserve) {
+      [blit copyFromBuffer:(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_
+              sourceOffset:hist_output_offset
+                  toBuffer:(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_
+         destinationOffset:0
+                      size:total_bins * 2 * sizeof(float)];
+    }
     [blit fillBuffer:histBuf
                range:NSMakeRange(hist_output_offset, total_bins * 2 * sizeof(float))
                value:0];
@@ -707,6 +715,41 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       log_stage("histogram/grouped_encode");
     }
 
+    if (leaf_hist_cache_buffer_ != nullptr && histogram_subtract_pipeline_ != nullptr &&
+        use_subtract && smaller_leaf != nullptr && larger_leaf != nullptr &&
+        smaller_leaf->leaf_index >= 0 && larger_leaf->leaf_index >= 0 &&
+        leaf_hist_num_items_ > 0) {
+      const int parent_leaf_index =
+          std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
+      id<MTLBuffer> parentBuf =
+          parent_leaf_index == smaller_leaf->leaf_index
+              ? (__bridge id<MTLBuffer>)leaf_hist_parent_buffer_
+              : (__bridge id<MTLBuffer>)leaf_hist_cache_buffer_;
+      const size_t parentOffset =
+          parent_leaf_index == smaller_leaf->leaf_index
+              ? 0
+              : static_cast<size_t>(parent_leaf_index) *
+                    leaf_hist_num_items_ * sizeof(float);
+      const size_t largerOffset =
+          static_cast<size_t>(larger_leaf->leaf_index) *
+          leaf_hist_num_items_ * sizeof(float);
+      id<MTLComputeCommandEncoder> enc4 = [cmdBuf computeCommandEncoder];
+      id<MTLComputePipelineState> subPso =
+          (__bridge id<MTLComputePipelineState>)histogram_subtract_pipeline_;
+      [enc4 setComputePipelineState:subPso];
+      [enc4 setBuffer:parentBuf offset:parentOffset atIndex:0];
+      [enc4 setBuffer:histBuf offset:hist_output_offset atIndex:1];
+      [enc4 setBuffer:(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_
+               offset:largerOffset
+              atIndex:2];
+      const uint32_t hist_items = static_cast<uint32_t>(leaf_hist_num_items_);
+      [enc4 setBytes:&hist_items length:sizeof(uint32_t) atIndex:3];
+      NSUInteger tg4 = std::min(256u, (uint32_t)[subPso maxTotalThreadsPerThreadgroup]);
+      [enc4 dispatchThreadgroups:MTLSizeMake((leaf_hist_num_items_ + tg4 - 1) / tg4, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg4, 1, 1)];
+      [enc4 endEncoding];
+    }
+
     [cmdBuf commit];
 
     [cmdBuf waitUntilCompleted];
@@ -720,33 +763,9 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
           hist_output_offset / sizeof(float);
       const size_t smaller_hist_offset =
           static_cast<size_t>(smaller_leaf->leaf_index) * leaf_hist_num_items_;
-      if (!use_cached_hist_output && use_subtract && larger_leaf != nullptr &&
-          larger_leaf->leaf_index >= 0) {
-        const int parent_leaf_index =
-            std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
-        if (parent_leaf_index == smaller_leaf->leaf_index) {
-          std::memcpy([(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents],
-                      leaf_hist_cache + smaller_hist_offset,
-                      leaf_hist_num_items_ * sizeof(float));
-        }
-      }
       if (!use_cached_hist_output) {
         std::memcpy(leaf_hist_cache + smaller_hist_offset, hist_float,
                     leaf_hist_num_items_ * sizeof(float));
-      }
-      if (use_subtract && larger_leaf != nullptr && larger_leaf->leaf_index >= 0) {
-        const int parent_leaf_index =
-            std::min(smaller_leaf->leaf_index, larger_leaf->leaf_index);
-        const float* parent_hist =
-            parent_leaf_index == smaller_leaf->leaf_index
-                ? reinterpret_cast<const float*>(
-                      [(__bridge id<MTLBuffer>)leaf_hist_parent_buffer_ contents])
-                : leaf_hist_cache + static_cast<size_t>(parent_leaf_index) * leaf_hist_num_items_;
-        float* larger_hist =
-            leaf_hist_cache + static_cast<size_t>(larger_leaf->leaf_index) * leaf_hist_num_items_;
-        for (size_t i = 0; i < leaf_hist_num_items_; ++i) {
-          larger_hist[i] = parent_hist[i] - hist_float[i];
-        }
       }
     }
 
