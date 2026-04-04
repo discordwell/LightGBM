@@ -348,6 +348,13 @@ EOF
             echo "[ERROR] cannot find pre-compiled library. Aborting"
             exit 1
         fi
+        if test -f ../build/lib_lightgbm.metallib; then
+            echo "[INFO] found matching lib_lightgbm.metallib in build/"
+            cp ../build/lib_lightgbm.metallib ./lightgbm/lib/lib_lightgbm.metallib
+        elif test -f ../lib_lightgbm.metallib; then
+            echo "[INFO] found matching lib_lightgbm.metallib at repo root"
+            cp ../lib_lightgbm.metallib ./lightgbm/lib/lib_lightgbm.metallib
+        fi
         rm -f ./*.bak
     fi
 
