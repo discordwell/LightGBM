@@ -321,10 +321,35 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
     }
   }
   SerialTreeLearner::BeforeTrain();
+  SyncPartitionToGPU();
   ResetMetalLeafStateTable();
   SyncMetalActiveLeafState();
   if (best_split_finder_ != nullptr) {
     best_split_finder_->BeforeTrain(col_sampler_.is_feature_used_bytree());
+  }
+}
+
+void MetalSingleGPUTreeLearner::SyncPartitionToGPU() {
+  if (data_indices_buffer_ == nullptr || data_partition_ == nullptr) {
+    return;
+  }
+  @autoreleasepool {
+    id<MTLBuffer> idx_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
+    std::memcpy([idx_buf contents], data_partition_->indices(),
+                static_cast<size_t>(num_data_) * sizeof(data_size_t));
+  }
+}
+
+void MetalSingleGPUTreeLearner::SyncPartitionRangeToCPU(data_size_t begin,
+                                                        data_size_t count) {
+  if (count <= 0 || data_indices_buffer_ == nullptr || data_partition_ == nullptr) {
+    return;
+  }
+  @autoreleasepool {
+    id<MTLBuffer> idx_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
+    const auto* src = reinterpret_cast<const data_size_t*>([idx_buf contents]) + begin;
+    std::memcpy(data_partition_->mutable_indices() + begin, src,
+                static_cast<size_t>(count) * sizeof(data_size_t));
   }
 }
 
@@ -575,6 +600,11 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
 
   // --- Dispatch ---
   @autoreleasepool {
+    const size_t leaf_indices_offset =
+        smaller_leaf != nullptr
+            ? static_cast<size_t>(smaller_leaf->data_indices_offset) *
+                  sizeof(data_size_t)
+            : 0;
     const bool use_cached_hist_output =
         enable_gpu_split && leaf_hist_cache_buffer_ != nullptr &&
         smaller_leaf != nullptr && smaller_leaf->leaf_index >= 0 &&
@@ -611,15 +641,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
                value:0];
     [blit endEncoding];
 
-    // Copy data indices
     id<MTLBuffer> idx_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
-    if (num_data_in_leaf == num_data_) {
-      int* idx_ptr = reinterpret_cast<int*>([idx_buf contents]);
-      for (data_size_t i = 0; i < num_data_; ++i) idx_ptr[i] = i;
-    } else {
-      std::memcpy([idx_buf contents], data_indices,
-                  num_data_in_leaf * sizeof(data_size_t));
-    }
 
     if (use_row_parallel_) {
       const uint32_t subhist_parts = std::min<uint32_t>(
@@ -635,7 +657,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       [enc setComputePipelineState:gPso];
       [enc setBuffer:(__bridge id<MTLBuffer>)gradients_buffer_ offset:0 atIndex:0];
       [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
-      [enc setBuffer:idx_buf offset:0 atIndex:2];
+      [enc setBuffer:idx_buf offset:leaf_indices_offset atIndex:2];
       [enc setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:3];
       [enc setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:4];
       [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_packed_buffer_ offset:0 atIndex:5];
@@ -698,7 +720,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
       [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_col_buffer_ offset:0 atIndex:2];
       [enc setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:3];
-      [enc setBuffer:idx_buf offset:0 atIndex:4];
+      [enc setBuffer:idx_buf offset:leaf_indices_offset atIndex:4];
       [enc setBuffer:histBuf offset:hist_output_offset atIndex:5];
       uint32_t nd = static_cast<uint32_t>(num_data_in_leaf);
       uint32_t ng = static_cast<uint32_t>(num_groups);
@@ -1047,12 +1069,13 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
   const data_size_t cnt = leaf_state->num_data_in_leaf;
   CHECK_EQ(begin, data_partition_->leaf_begin(leaf));
   CHECK_EQ(cnt, data_partition_->leaf_count(leaf));
-  const data_size_t* leaf_indices = data_partition_->indices() + begin;
 
   @autoreleasepool {
     id<MTLBuffer> input_buf = (__bridge id<MTLBuffer>)data_indices_buffer_;
-    std::memcpy([input_buf contents], leaf_indices, cnt * sizeof(data_size_t));
-
+    const NSUInteger input_offset =
+        static_cast<NSUInteger>(begin) * sizeof(data_size_t);
+    const NSUInteger output_offset =
+        static_cast<NSUInteger>(begin) * sizeof(data_size_t);
     id<MTLBuffer> count_buf = (__bridge id<MTLBuffer>)partition_counts_buffer_;
     std::memset([count_buf contents], 0, 2 * sizeof(uint32_t));
 
@@ -1066,16 +1089,9 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
     const uint32_t most_freq_bin = bin_mapper->GetMostFreqBin();
     const uint32_t max_bin =
         static_cast<uint32_t>(train_data_->FeatureGroupNumBin(group) - 1);
-    const uint32_t raw_threshold =
-        threshold + (most_freq_bin == 0 ? 0u : 1u);
-    const uint32_t raw_default_bin =
-        bin_mapper->GetDefaultBin() + (most_freq_bin == 0 ? 0u : 1u);
+    const uint32_t default_bin = bin_mapper->GetDefaultBin();
     const MissingType missing_type = bin_mapper->missing_type();
-    const int32_t split_default_to_left =
-        (most_freq_bin <= threshold) ? 1 : 0;
-    const int32_t split_missing_default_to_left =
-        ((missing_type == MissingType::Zero ||
-          missing_type == MissingType::NaN) && default_left) ? 1 : 0;
+    const int32_t split_default_left = default_left ? 1 : 0;
     const int32_t missing_is_zero = missing_type == MissingType::Zero ? 1 : 0;
     const int32_t missing_is_na = missing_type == MissingType::NaN ? 1 : 0;
     const int32_t mfb_is_zero =
@@ -1084,35 +1100,41 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
     const int32_t mfb_is_na =
         (missing_type == MissingType::NaN && most_freq_bin > 0 &&
          most_freq_bin + 1 == max_bin) ? 1 : 0;
-    const int32_t max_bin_to_left = raw_threshold >= max_bin ? 1 : 0;
     const uint32_t num_data_in_leaf = static_cast<uint32_t>(cnt);
 
     [encoder setComputePipelineState:pso];
     [encoder setBuffer:(__bridge id<MTLBuffer>)bin_data_col_buffer_
                 offset:static_cast<NSUInteger>(group) * static_cast<NSUInteger>(num_data_)
                atIndex:0];
-    [encoder setBuffer:input_buf offset:0 atIndex:1];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)partition_output_buffer_ offset:0 atIndex:2];
+    [encoder setBuffer:input_buf offset:input_offset atIndex:1];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)partition_output_buffer_
+                offset:output_offset
+               atIndex:2];
     [encoder setBuffer:count_buf offset:0 atIndex:3];
     [encoder setBytes:&num_data_in_leaf length:sizeof(num_data_in_leaf) atIndex:4];
-    [encoder setBytes:&raw_threshold length:sizeof(raw_threshold) atIndex:5];
-    [encoder setBytes:&raw_default_bin length:sizeof(raw_default_bin) atIndex:6];
-    [encoder setBytes:&max_bin length:sizeof(max_bin) atIndex:7];
-    [encoder setBytes:&split_default_to_left
-                length:sizeof(split_default_to_left) atIndex:8];
-    [encoder setBytes:&split_missing_default_to_left
-                length:sizeof(split_missing_default_to_left) atIndex:9];
+    [encoder setBytes:&threshold length:sizeof(threshold) atIndex:5];
+    [encoder setBytes:&default_bin length:sizeof(default_bin) atIndex:6];
+    [encoder setBytes:&most_freq_bin length:sizeof(most_freq_bin) atIndex:7];
+    [encoder setBytes:&max_bin length:sizeof(max_bin) atIndex:8];
+    [encoder setBytes:&split_default_left
+                length:sizeof(split_default_left) atIndex:9];
     [encoder setBytes:&missing_is_zero length:sizeof(missing_is_zero) atIndex:10];
     [encoder setBytes:&missing_is_na length:sizeof(missing_is_na) atIndex:11];
     [encoder setBytes:&mfb_is_zero length:sizeof(mfb_is_zero) atIndex:12];
     [encoder setBytes:&mfb_is_na length:sizeof(mfb_is_na) atIndex:13];
-    [encoder setBytes:&max_bin_to_left length:sizeof(max_bin_to_left) atIndex:14];
 
     const NSUInteger tg =
         std::min(256u, static_cast<uint32_t>([pso maxTotalThreadsPerThreadgroup]));
     [encoder dispatchThreadgroups:MTLSizeMake((num_data_in_leaf + tg - 1) / tg, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     [encoder endEncoding];
+    id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+    [blit copyFromBuffer:(__bridge id<MTLBuffer>)partition_output_buffer_
+            sourceOffset:output_offset
+                toBuffer:input_buf
+       destinationOffset:input_offset
+                    size:static_cast<NSUInteger>(cnt) * sizeof(data_size_t)];
+    [blit endEncoding];
     [cmd_buf commit];
     [cmd_buf waitUntilCompleted];
     METAL_CHECK([cmd_buf status] != MTLCommandBufferStatusError,
@@ -1123,10 +1145,7 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
     const uint32_t left_count = counts[0];
     const uint32_t right_count = counts[1];
     CHECK_EQ(static_cast<uint32_t>(cnt), left_count + right_count);
-
-    std::memcpy(data_partition_->mutable_indices() + begin,
-                [(__bridge id<MTLBuffer>)partition_output_buffer_ contents],
-                cnt * sizeof(data_size_t));
+    SyncPartitionRangeToCPU(begin, cnt);
     return static_cast<data_size_t>(left_count);
   }
 }
@@ -1142,6 +1161,7 @@ void MetalSingleGPUTreeLearner::Split(
       std::getenv("LIGHTGBM_METAL_DISABLE_GPU_PARTITION") == nullptr;
   if (!enable_gpu_partition) {
     SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+    SyncPartitionToGPU();
     SyncMetalActiveLeafState();
     return;
   }
@@ -1187,11 +1207,30 @@ void MetalSingleGPUTreeLearner::Split(
     Log::Fatal("Metal tree learner only supports numerical splits.");
   }
 
+  const data_size_t expected_left_count = best_split_info.left_count;
+  const data_size_t expected_right_count = best_split_info.right_count;
   const data_size_t left_count = PartitionLeafOnGPU(
       best_leaf, inner_feature_index, best_split_info.threshold,
       best_split_info.default_left);
   const data_size_t total_count = data_partition_->leaf_count(best_leaf);
   const data_size_t right_count = total_count - left_count;
+  if (left_count <= 0 || right_count <= 0 ||
+      left_count != expected_left_count ||
+      right_count != expected_right_count) {
+    if (std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
+      fprintf(stderr,
+              "[Metal] partition mismatch on leaf=%d feature=%d threshold=%u expected=%d/%d actual=%d/%d; falling back to CPU partition\n",
+              best_leaf, best_split_info.feature, best_split_info.threshold,
+              static_cast<int>(expected_left_count),
+              static_cast<int>(expected_right_count),
+              static_cast<int>(left_count),
+              static_cast<int>(right_count));
+    }
+    SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+    SyncPartitionToGPU();
+    SyncMetalActiveLeafState();
+    return;
+  }
   data_partition_->ApplyExternalSplit(best_leaf, next_leaf_id, left_count);
   best_split_info.left_count = left_count;
   best_split_info.right_count = right_count;

@@ -498,52 +498,57 @@ kernel void partition_indices_numeric(
     device int*           output_indices    [[buffer(2)]],
     device atomic_uint*   partition_counts  [[buffer(3)]],  // [left_count, right_count]
     constant uint&        num_data_in_leaf  [[buffer(4)]],
-    constant uint&        threshold         [[buffer(5)]],   // threshold in stored-bin space
-    constant uint&        default_bin       [[buffer(6)]],   // default bin in stored-bin space
-    constant uint&        max_bin           [[buffer(7)]],
-    constant int&         split_default_to_left [[buffer(8)]],
-    constant int&         split_missing_default_to_left [[buffer(9)]],
+    constant uint&        threshold         [[buffer(5)]],   // CPU split threshold
+    constant uint&        default_bin       [[buffer(6)]],
+    constant uint&        most_freq_bin     [[buffer(7)]],
+    constant uint&        max_bin           [[buffer(8)]],   // stored-bin max
+    constant int&         default_left      [[buffer(9)]],
     constant int&         missing_is_zero   [[buffer(10)]],
     constant int&         missing_is_na     [[buffer(11)]],
     constant int&         mfb_is_zero       [[buffer(12)]],
     constant int&         mfb_is_na         [[buffer(13)]],
-    constant int&         max_bin_to_left   [[buffer(14)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_data_in_leaf) return;
 
     const int row = input_indices[gid];
     const uint bin = group_bins[row];
-    bool go_left = false;
+    const uint th = threshold + 1u - (most_freq_bin == 0u ? 1u : 0u);
+    const uint t_zero_bin = 1u + default_bin - (most_freq_bin == 0u ? 1u : 0u);
+    const bool default_to_left = most_freq_bin <= threshold;
+    const bool missing_default_to_left = default_left != 0;
+    const bool wide_case = 1u < max_bin;
+    bool go_left;
 
-    if (max_bin > 1u) {
-        if ((missing_is_zero && !mfb_is_zero && bin == default_bin) ||
+    if (wide_case) {
+        if ((missing_is_zero && !mfb_is_zero && bin == t_zero_bin) ||
             (missing_is_na && !mfb_is_na && bin == max_bin)) {
-            go_left = (split_missing_default_to_left != 0);
+            go_left = missing_default_to_left;
         } else if (bin == 0u) {
             if ((missing_is_na && mfb_is_na) ||
                 (missing_is_zero && mfb_is_zero)) {
-                go_left = (split_missing_default_to_left != 0);
+                go_left = missing_default_to_left;
             } else {
-                go_left = (split_default_to_left != 0);
+                go_left = default_to_left;
             }
-        } else if (bin <= threshold) {
-            go_left = true;
+        } else {
+            go_left = !(bin > th);
         }
     } else {
-        if (missing_is_zero && !mfb_is_zero && bin == default_bin) {
-            go_left = (split_missing_default_to_left != 0);
+        const bool max_bin_to_left = max_bin <= th;
+        if (missing_is_zero && !mfb_is_zero && bin == t_zero_bin) {
+            go_left = missing_default_to_left;
         } else if (bin != max_bin) {
             if ((missing_is_na && mfb_is_na) ||
                 (missing_is_zero && mfb_is_zero)) {
-                go_left = (split_missing_default_to_left != 0);
+                go_left = missing_default_to_left;
             } else {
-                go_left = (split_default_to_left != 0);
+                go_left = default_to_left;
             }
         } else if (missing_is_na && !mfb_is_na) {
-            go_left = (split_missing_default_to_left != 0);
+            go_left = missing_default_to_left;
         } else {
-            go_left = (max_bin_to_left != 0);
+            go_left = max_bin_to_left;
         }
     }
 

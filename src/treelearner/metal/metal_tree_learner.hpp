@@ -66,6 +66,8 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
 
   /*! \brief Allocate Metal buffers for gradient/hessian/indices */
   void AllocateMetalBuffers();
+  void SyncPartitionToGPU();
+  void SyncPartitionRangeToCPU(data_size_t begin, data_size_t count);
   void ResetMetalLeafStateTable();
   void SyncMetalActiveLeafState();
   void SyncMetalLeafState(int leaf_index, const LeafSplits* leaf_splits);
