@@ -223,10 +223,19 @@ void MetalSingleGPUTreeLearner::BuildFeatureGroupMaps() {
   if (env != nullptr) {
     min_features = std::max(1, std::atoi(env));
   }
-  use_gpu_histogram_ = (num_dense_feature_groups_ >= min_features);
+  // GPU histogram is currently correct only for pure-dense datasets.
+  // When sparse groups exist, the GPU group-offset mapping doesn't account
+  // for multi-val groups interleaved in the layout, producing wrong
+  // histograms.  Fall back to CPU until the kernel addressing is fixed.
+  use_gpu_histogram_ = (num_dense_feature_groups_ >= min_features &&
+                         sparse_feature_group_map_.empty());
   if (!use_gpu_histogram_ && num_dense_feature_groups_ > 0) {
-    Log::Info("Metal: falling back to CPU (%d dense groups < threshold %d)",
-              num_dense_feature_groups_, min_features);
+    if (!sparse_feature_group_map_.empty()) {
+      Log::Info("Metal: falling back to CPU (sparse feature groups present)");
+    } else {
+      Log::Info("Metal: falling back to CPU (%d dense groups < threshold %d)",
+                num_dense_feature_groups_, min_features);
+    }
   }
 }
 
@@ -694,8 +703,13 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
                                         static_cast<size_t>(num_data_) *
                                         sizeof(PackedFeatureTuple)
                                 options:MTLResourceStorageModeShared]);
-        replace(subhist_buffer_, [dev newBufferWithLength:static_cast<size_t>(num_dense_feature_tuples_) *
-                                                        kMaxSubhistParts * 4 * 256 * 2 *
+        // The packed path uses num_dense_feature_tuples_*4 groups; the non-packed
+        // gathered path dispatches over all num_groups (including sparse, which
+        // have zeroed bin data).  Size for whichever is larger to avoid overrun.
+        const size_t subhist_groups = static_cast<size_t>(
+            std::max(num_dense_feature_tuples_ * 4, num_groups));
+        replace(subhist_buffer_, [dev newBufferWithLength:subhist_groups *
+                                                        kMaxSubhistParts * 256 * 2 *
                                                         sizeof(float)
                                                   options:MTLResourceStorageModeShared]);
       }
@@ -973,11 +987,9 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     }
 
     // CPU histogram construction for sparse (multi-val) feature groups.
-    // MUST run BEFORE the dense GPU copy-out below: the multi-val HistMerge
-    // writes to the full hist buffer starting at offset 0, which can clobber
-    // dense positions.  The subsequent GPU dense copy overwrites those
-    // positions with the correct GPU-computed values (same ordering as the
-    // OpenCL gpu_tree_learner).
+    // The multi-val HistMerge writes to origin_hist_data at offset 0 which
+    // clobbers dense bins.  We use a temporary buffer, then selectively copy
+    // only the sparse group bins into both the hist_t buffer and float cache.
     if (!sparse_feature_group_map_.empty()) {
       std::vector<int8_t> is_sparse_used(num_features_, 0);
       for (int fi = 0; fi < num_features_; ++fi) {
@@ -986,17 +998,68 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
           is_sparse_used[fi] = 1;
         }
       }
+      // Use a temporary buffer so HistMerge doesn't corrupt the dense bins
+      // in the real histogram buffer.
+      std::vector<hist_t> sparse_hist_tmp(static_cast<size_t>(total_bins) * 2, 0);
+      hist_t* sparse_hist_ptr = sparse_hist_tmp.data();
       train_data_->ConstructHistograms<false, 0>(
           is_sparse_used, data_indices, num_data_in_leaf,
           gradients_, hessians_,
           ordered_gradients_.data(), ordered_hessians_.data(),
-          share_state_.get(), ptr_smaller_leaf_hist_data);
+          share_state_.get(), sparse_hist_ptr);
+
+      // Copy only sparse group bins from temp → hist_t buffer.
+      for (int sg : sparse_feature_group_map_) {
+        const int start = train_data_->GroupBinBoundary(sg);
+        const int nbins = train_data_->GroupBinBoundary(sg + 1) - start;
+        std::memcpy(ptr_smaller_leaf_hist_data + start * 2,
+                    sparse_hist_ptr + start * 2,
+                    nbins * 2 * sizeof(hist_t));
+      }
+
+      // Patch the GPU float cache with sparse values for the smaller leaf.
+      if (leaf_hist_cache_buffer_ != nullptr && smaller_leaf != nullptr &&
+          smaller_leaf->leaf_index >= 0) {
+        float* leaf_hist_cache =
+            reinterpret_cast<float*>([(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
+        const size_t smaller_hist_offset =
+            static_cast<size_t>(smaller_leaf->leaf_index) * leaf_hist_num_items_;
+        for (int sg : sparse_feature_group_map_) {
+          const int start = train_data_->GroupBinBoundary(sg);
+          const int nbins = train_data_->GroupBinBoundary(sg + 1) - start;
+          for (int b = 0; b < nbins; ++b) {
+            leaf_hist_cache[smaller_hist_offset + (start + b) * 2] =
+                static_cast<float>(sparse_hist_ptr[(start + b) * 2]);
+            leaf_hist_cache[smaller_hist_offset + (start + b) * 2 + 1] =
+                static_cast<float>(sparse_hist_ptr[(start + b) * 2 + 1]);
+          }
+        }
+
+        // Fix the larger leaf's sparse bins.  GPU subtract computed
+        // larger = parent - smaller, but smaller's sparse bins were 0 at
+        // that point.  Correct: larger -= smaller_sparse.
+        if (use_subtract && larger_leaf != nullptr &&
+            larger_leaf->leaf_index >= 0) {
+          const size_t larger_hist_offset =
+              static_cast<size_t>(larger_leaf->leaf_index) * leaf_hist_num_items_;
+          for (int sg : sparse_feature_group_map_) {
+            const int start = train_data_->GroupBinBoundary(sg);
+            const int nbins = train_data_->GroupBinBoundary(sg + 1) - start;
+            for (int b = 0; b < nbins; ++b) {
+              const size_t idx = (start + b) * 2;
+              leaf_hist_cache[larger_hist_offset + idx] -=
+                  leaf_hist_cache[smaller_hist_offset + idx];
+              leaf_hist_cache[larger_hist_offset + idx + 1] -=
+                  leaf_hist_cache[smaller_hist_offset + idx + 1];
+            }
+          }
+        }
+      }
     }
     timer.Log("histogram/sparse_cpu");
 
     if (!enable_gpu_split) {
-      // Legacy CPU split search: copy GPU dense results into hist_t buffer,
-      // overwriting any dense bins that the sparse HistMerge may have clobbered.
+      // CPU split search needs dense results in hist_t buffer.
       const float* hist_float =
           reinterpret_cast<const float*>([histBuf contents]) +
           hist_output_offset / sizeof(float);
@@ -1011,28 +1074,6 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
           dst[b * 2 + 1] = static_cast<hist_t>(src[b * 2 + 1]);
         }
       }
-    }
-
-    // Patch the GPU float cache with CPU-computed sparse histogram values
-    // so the Metal split finder sees correct values for all feature groups.
-    if (!sparse_feature_group_map_.empty() &&
-        leaf_hist_cache_buffer_ != nullptr && smaller_leaf != nullptr &&
-        smaller_leaf->leaf_index >= 0) {
-      float* leaf_hist_cache =
-          reinterpret_cast<float*>([(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
-      const size_t smaller_hist_offset =
-          static_cast<size_t>(smaller_leaf->leaf_index) * leaf_hist_num_items_;
-      for (int sg : sparse_feature_group_map_) {
-        const int start = train_data_->GroupBinBoundary(sg);
-        const int nbins = train_data_->GroupBinBoundary(sg + 1) - start;
-        for (int b = 0; b < nbins; ++b) {
-          leaf_hist_cache[smaller_hist_offset + (start + b) * 2] =
-              static_cast<float>(ptr_smaller_leaf_hist_data[(start + b) * 2]);
-          leaf_hist_cache[smaller_hist_offset + (start + b) * 2 + 1] =
-              static_cast<float>(ptr_smaller_leaf_hist_data[(start + b) * 2 + 1]);
-        }
-      }
-
     }
 
     timer.Log("histogram/copyout");
