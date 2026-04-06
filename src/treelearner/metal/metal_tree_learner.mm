@@ -223,10 +223,10 @@ void MetalSingleGPUTreeLearner::BuildFeatureGroupMaps() {
   if (env != nullptr) {
     min_features = std::max(1, std::atoi(env));
   }
-  // GPU histogram is currently correct only for pure-dense datasets.
-  // When sparse groups exist, the GPU group-offset mapping doesn't account
-  // for multi-val groups interleaved in the layout, producing wrong
-  // histograms.  Fall back to CPU until the kernel addressing is fixed.
+  // GPU histogram handles dense-only datasets correctly.  When sparse
+  // groups are present, the GPU partition and split-finder interaction
+  // with interleaved sparse bins still has edge-case issues — fall back
+  // to CPU for safety (CPU fallback is still fast via SerialTreeLearner).
   use_gpu_histogram_ = (num_dense_feature_groups_ >= min_features &&
                          sparse_feature_group_map_.empty());
   if (!use_gpu_histogram_ && num_dense_feature_groups_ > 0) {
@@ -1322,8 +1322,11 @@ data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
 
     const BinMapper* bin_mapper = train_data_->FeatureBinMapper(inner_feature_index);
     const uint32_t most_freq_bin = bin_mapper->GetMostFreqBin();
+    // Use the feature's own num_bin, not the group's num_total_bin which
+    // includes an offset bin for non-first groups with most_freq_bin != 0.
+    // RawGet() returns raw bin values [0, num_bin-1]; NaN is at num_bin-1.
     const uint32_t max_bin =
-        static_cast<uint32_t>(train_data_->FeatureGroupNumBin(group) - 1);
+        static_cast<uint32_t>(bin_mapper->num_bin() - 1);
     const uint32_t default_bin = bin_mapper->GetDefaultBin();
     const MissingType missing_type = bin_mapper->missing_type();
     const int32_t split_default_left = default_left ? 1 : 0;
