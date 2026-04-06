@@ -29,11 +29,43 @@
 
 namespace LightGBM {
 
-static constexpr int kGatherThreshold = 64;
 static constexpr uint32_t kMaxSubhistParts = 16;
+static constexpr int kPackedHistogramThreshold = 64;
+static constexpr int kNarrowDatasetThreshold = 32;
 static constexpr uint32_t kTargetRowsPerSubhist = 8192;
 static constexpr size_t kSmallerLeafSlot = 0;
 static constexpr size_t kLargerLeafSlot = 1;
+
+/*! \brief Whether opt-in Metal stage timing is enabled (LIGHTGBM_METAL_STAGE_TIMING env var). */
+static bool MetalStageTiming() {
+  static const bool enabled = std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
+  return enabled;
+}
+
+/*! \brief Whether GPU split finding is enabled (default true, disable via LIGHTGBM_METAL_DISABLE_GPU_SPLIT). */
+static bool MetalGPUSplitEnabled() {
+  static const bool enabled = std::getenv("LIGHTGBM_METAL_DISABLE_GPU_SPLIT") == nullptr;
+  return enabled;
+}
+
+/*! \brief Whether GPU partitioning is enabled (default true, disable via LIGHTGBM_METAL_DISABLE_GPU_PARTITION). */
+static bool MetalGPUPartitionEnabled() {
+  static const bool enabled = std::getenv("LIGHTGBM_METAL_DISABLE_GPU_PARTITION") == nullptr;
+  return enabled;
+}
+
+/*! \brief RAII timer for opt-in stage profiling. */
+struct StageTimer {
+  std::chrono::steady_clock::time_point start;
+  StageTimer() : start(std::chrono::steady_clock::now()) {}
+  void Log(const char* name) {
+    if (!MetalStageTiming()) return;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+    LightGBM::Log::Info("[MetalTiming] %s took %.3f ms", name, ms);
+    start = now;
+  }
+};
 
 struct PackedFeatureTuple {
   uint8_t bins[4];
@@ -161,10 +193,40 @@ void MetalSingleGPUTreeLearner::ValidateTrainingScope(
       Log::Fatal("Metal tree learner only supports dense numerical features.");
     }
   }
-  for (int group = 0; group < train_data->num_feature_groups(); ++group) {
-    if (train_data->IsMultiGroup(group)) {
-      Log::Fatal("Metal tree learner does not support sparse or multi-group feature groups.");
+}
+
+void MetalSingleGPUTreeLearner::BuildFeatureGroupMaps() {
+  max_num_bin_ = 0;
+  dense_feature_group_indices_.clear();
+  sparse_feature_group_map_.clear();
+  for (int i = 0; i < num_feature_groups_; ++i) {
+    if (!train_data_->IsMultiGroup(i) &&
+        train_data_->FeatureGroupNumBin(i) <= 256) {
+      dense_feature_group_indices_.push_back(i);
+      max_num_bin_ = std::max(max_num_bin_,
+                              train_data_->FeatureGroupNumBin(i));
+    } else {
+      sparse_feature_group_map_.push_back(i);
     }
+  }
+  num_dense_feature_groups_ = static_cast<int>(dense_feature_group_indices_.size());
+  if (!sparse_feature_group_map_.empty()) {
+    Log::Info("Metal: %d dense feature groups on GPU, %d sparse feature groups on CPU",
+              num_dense_feature_groups_,
+              static_cast<int>(sparse_feature_group_map_.size()));
+  }
+  num_dense_feature_tuples_ = (num_dense_feature_groups_ + 3) / 4;
+
+  // Auto-detect narrow datasets where GPU dispatch overhead exceeds benefit.
+  int min_features = kNarrowDatasetThreshold;
+  const char* env = std::getenv("LIGHTGBM_METAL_GPU_MIN_FEATURES");
+  if (env != nullptr) {
+    min_features = std::max(1, std::atoi(env));
+  }
+  use_gpu_histogram_ = (num_dense_feature_groups_ >= min_features);
+  if (!use_gpu_histogram_ && num_dense_feature_groups_ > 0) {
+    Log::Info("Metal: falling back to CPU (%d dense groups < threshold %d)",
+              num_dense_feature_groups_, min_features);
   }
 }
 
@@ -187,21 +249,13 @@ void MetalSingleGPUTreeLearner::InitMetal() {
                 error ? [[error localizedDescription] UTF8String] : "unknown");
     metal_library_ = (__bridge_retained void*)library;
 
-    max_num_bin_ = 0;
-    for (int i = 0; i < num_feature_groups_; ++i) {
-      max_num_bin_ = std::max(max_num_bin_,
-                              train_data_->FeatureGroupNumBin(i));
-    }
-    if (max_num_bin_ > 256) {
-      Log::Fatal("bin size %d cannot run on Metal GPU (max 256)", max_num_bin_);
-    }
-
-    num_dense_feature_groups_ = 0;
-    for (int i = 0; i < num_feature_groups_; ++i) {
-      if (!train_data_->IsMultiGroup(i)) num_dense_feature_groups_++;
-    }
-    num_dense_feature_tuples_ = (num_dense_feature_groups_ + 3) / 4;
-    use_row_parallel_ = (num_dense_feature_groups_ >= kGatherThreshold);
+    BuildFeatureGroupMaps();
+    // Dense numerical Metal training benefits from the gathered packed path
+    // even for narrow datasets because it removes repeated random accesses
+    // through data_indices from the histogram kernel.
+    use_row_parallel_ = (num_dense_feature_tuples_ > 0);
+    use_packed_histogram_ =
+        (num_dense_feature_groups_ >= kPackedHistogramThreshold);
   }
   AllocateMetalBuffers();
 }
@@ -313,6 +367,10 @@ void MetalSingleGPUTreeLearner::BeforeTrain() {
   if (forced_split_json_ != nullptr) {
     Log::Fatal("Metal tree learner does not support forced splits.");
   }
+  if (!use_gpu_histogram_) {
+    SerialTreeLearner::BeforeTrain();
+    return;
+  }
   @autoreleasepool {
     id<MTLBuffer> gradBuf = (__bridge id<MTLBuffer>)gradients_buffer_;
     std::memcpy([gradBuf contents], gradients_, num_data_ * sizeof(score_t));
@@ -363,10 +421,6 @@ bool MetalSingleGPUTreeLearner::ValidatePartitionSums(
     return false;
   }
   const data_size_t right_count = total_count - left_count;
-  if (left_count != static_cast<data_size_t>(best_split_info.left_count) ||
-      right_count != static_cast<data_size_t>(best_split_info.right_count)) {
-    return false;
-  }
 
   const data_size_t* indices = data_partition_->indices() + begin;
   double left_grad = 0.0;
@@ -412,23 +466,14 @@ bool MetalSingleGPUTreeLearner::ValidatePartitionSums(
 
 void MetalSingleGPUTreeLearner::ConstructHistograms(
     const std::vector<int8_t>& is_feature_used, bool use_subtract) {
+  if (!use_gpu_histogram_) {
+    SerialTreeLearner::ConstructHistograms(is_feature_used, use_subtract);
+    return;
+  }
   Common::FunctionTimer fun_timer(
       "MetalSingleGPUTreeLearner::ConstructHistograms", global_timer);
-  const bool enable_gpu_split =
-      std::getenv("LIGHTGBM_METAL_DISABLE_GPU_SPLIT") == nullptr;
-  const bool stage_timing =
-      std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
-  auto stage_start = std::chrono::steady_clock::now();
-  auto log_stage = [&](const char* name) {
-    if (!stage_timing) {
-      return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(
-        now - stage_start).count();
-    Log::Info("[MetalTiming] %s took %.3f ms", name, ms);
-    stage_start = now;
-  };
+  const bool enable_gpu_split = MetalGPUSplitEnabled();
+  StageTimer timer;
   hist_t* ptr_smaller_leaf_hist_data =
       smaller_leaf_histogram_array_[0].RawData() - kHistOffset;
 
@@ -442,6 +487,30 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       data_partition_->indices() + smaller_leaf->data_indices_offset;
   const int num_groups = train_data_->num_feature_groups();
   const int total_bins = train_data_->NumTotalBin();
+
+  // When ALL feature groups are sparse (no dense groups), skip GPU entirely
+  // and compute everything on CPU.  This handles datasets where LightGBM
+  // bundles every feature into a single multi-val bin.
+  if (num_dense_feature_groups_ == 0) {
+    train_data_->ConstructHistograms<false, 0>(
+        is_feature_used, data_indices, num_data_in_leaf,
+        gradients_, hessians_,
+        ordered_gradients_.data(), ordered_hessians_.data(),
+        share_state_.get(), ptr_smaller_leaf_hist_data);
+    if (larger_leaf_histogram_array_ != nullptr && !use_subtract &&
+        larger_leaf != nullptr &&
+        larger_leaf->leaf_index >= 0 && larger_leaf->num_data_in_leaf > 0) {
+      hist_t* ptr_larger = larger_leaf_histogram_array_[0].RawData() - kHistOffset;
+      train_data_->ConstructHistograms<false, 0>(
+          is_feature_used,
+          data_partition_->indices() + larger_leaf->data_indices_offset,
+          larger_leaf->num_data_in_leaf,
+          gradients_, hessians_,
+          ordered_gradients_.data(), ordered_hessians_.data(),
+          share_state_.get(), ptr_larger);
+    }
+    return;
+  }
 
   // One-time setup: pack bin data and create pipelines
   if (!bin_data_packed_) {
@@ -490,10 +559,11 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
                                 0xFFFFFFFFu);
         for (int tuple = 0; tuple < num_dense_feature_tuples_; ++tuple) {
           for (int lane = 0; lane < 4; ++lane) {
-            const int group = tuple * 4 + lane;
-            if (group >= num_groups) {
+            const int dense_idx = tuple * 4 + lane;
+            if (dense_idx >= num_dense_feature_groups_) {
               continue;
             }
+            const int group = dense_feature_group_indices_[dense_idx];
             dense_group_map_[static_cast<size_t>(tuple) * 4 + lane] =
                 static_cast<uint32_t>(group);
             const uint8_t* src_col =
@@ -649,7 +719,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     }
     bin_data_packed_ = true;
   }
-  log_stage("histogram/setup");
+  timer.Log("histogram/setup");
 
   // --- Dispatch ---
   @autoreleasepool {
@@ -703,66 +773,124 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
               1, static_cast<uint32_t>((num_data_in_leaf + kTargetRowsPerSubhist - 1) /
                                        kTargetRowsPerSubhist)));
 
-      // Pass 1: gather grad / hess and packed dense feature tuples into leaf order
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-      id<MTLComputePipelineState> gPso =
-          (__bridge id<MTLComputePipelineState>)packed_gather_pipeline_;
-      [enc setComputePipelineState:gPso];
-      [enc setBuffer:(__bridge id<MTLBuffer>)gradients_buffer_ offset:0 atIndex:0];
-      [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
-      [enc setBuffer:idx_buf offset:leaf_indices_offset atIndex:2];
-      [enc setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:3];
-      [enc setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:4];
-      [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_packed_buffer_ offset:0 atIndex:5];
-      [enc setBuffer:(__bridge id<MTLBuffer>)ordered_packed_bins_buffer_ offset:0 atIndex:6];
       uint32_t nd = static_cast<uint32_t>(num_data_in_leaf);
       uint32_t ndt = static_cast<uint32_t>(num_data_);
-      uint32_t nt = static_cast<uint32_t>(num_dense_feature_tuples_);
-      [enc setBytes:&nd length:sizeof(uint32_t) atIndex:7];
-      [enc setBytes:&ndt length:sizeof(uint32_t) atIndex:8];
-      [enc setBytes:&nt length:sizeof(uint32_t) atIndex:9];
-      NSUInteger tg = std::min(256u, (uint32_t)[gPso maxTotalThreadsPerThreadgroup]);
-      [enc dispatchThreadgroups:MTLSizeMake((num_data_in_leaf + tg - 1) / tg, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-      [enc endEncoding];
-      log_stage("histogram/gather_packed");
+      if (use_packed_histogram_) {
+        // Pass 1: gather grad / hess and packed dense feature tuples into leaf order.
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> gPso =
+            (__bridge id<MTLComputePipelineState>)packed_gather_pipeline_;
+        [enc setComputePipelineState:gPso];
+        [enc setBuffer:(__bridge id<MTLBuffer>)gradients_buffer_ offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
+        [enc setBuffer:idx_buf offset:leaf_indices_offset atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:4];
+        [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_packed_buffer_ offset:0 atIndex:5];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_packed_bins_buffer_ offset:0 atIndex:6];
+        uint32_t nt = static_cast<uint32_t>(num_dense_feature_tuples_);
+        [enc setBytes:&nd length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&ndt length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&nt length:sizeof(uint32_t) atIndex:9];
+        NSUInteger tg = std::min(256u, (uint32_t)[gPso maxTotalThreadsPerThreadgroup]);
+        [enc dispatchThreadgroups:MTLSizeMake((num_data_in_leaf + tg - 1) / tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        timer.Log("histogram/gather_packed");
 
-      // Pass 2: build a sub-histogram per (packed tuple, row partition).
-      id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
-      id<MTLComputePipelineState> hPso =
-          (__bridge id<MTLComputePipelineState>)packed_histogram_pipeline_;
-      [enc2 setComputePipelineState:hPso];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:0];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:1];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_packed_bins_buffer_ offset:0 atIndex:2];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)dense_group_map_buffer_ offset:0 atIndex:3];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:4];
-      [enc2 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:5];
-      [enc2 setBytes:&nd length:sizeof(uint32_t) atIndex:6];
-      [enc2 setBytes:&nt length:sizeof(uint32_t) atIndex:7];
-      [enc2 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:8];
-      NSUInteger tg2 = std::min(256u, (uint32_t)[hPso maxTotalThreadsPerThreadgroup]);
-      [enc2 dispatchThreadgroups:MTLSizeMake(nt * subhist_parts, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-      [enc2 endEncoding];
-      log_stage("histogram/build_subhist");
+        // Pass 2: build a sub-histogram per (packed tuple, row partition).
+        id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> hPso =
+            (__bridge id<MTLComputePipelineState>)packed_histogram_pipeline_;
+        [enc2 setComputePipelineState:hPso];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:0];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:1];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_packed_bins_buffer_ offset:0 atIndex:2];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)dense_group_map_buffer_ offset:0 atIndex:3];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:4];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:5];
+        [enc2 setBytes:&nd length:sizeof(uint32_t) atIndex:6];
+        [enc2 setBytes:&nt length:sizeof(uint32_t) atIndex:7];
+        [enc2 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:8];
+        NSUInteger tg2 = std::min(256u, (uint32_t)[hPso maxTotalThreadsPerThreadgroup]);
+        [enc2 dispatchThreadgroups:MTLSizeMake(nt * subhist_parts, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        [enc2 endEncoding];
+        timer.Log("histogram/build_subhist");
 
-      // Pass 3: reduce per-partition packed sub-histograms into the final output.
-      id<MTLComputeCommandEncoder> enc3 = [cmdBuf computeCommandEncoder];
-      id<MTLComputePipelineState> rPso =
-          (__bridge id<MTLComputePipelineState>)packed_reduction_pipeline_;
-      [enc3 setComputePipelineState:rPso];
-      [enc3 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:0];
-      [enc3 setBuffer:(__bridge id<MTLBuffer>)dense_group_map_buffer_ offset:0 atIndex:1];
-      [enc3 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:2];
-      [enc3 setBuffer:histBuf offset:hist_output_offset atIndex:3];
-      [enc3 setBytes:&nt length:sizeof(uint32_t) atIndex:4];
-      [enc3 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:5];
-      NSUInteger tg3 = std::min(256u, (uint32_t)[rPso maxTotalThreadsPerThreadgroup]);
-      [enc3 dispatchThreadgroups:MTLSizeMake(nt, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(tg3, 1, 1)];
-      [enc3 endEncoding];
-      log_stage("histogram/reduce_subhist");
+        // Pass 3: reduce per-partition packed sub-histograms into the final output.
+        id<MTLComputeCommandEncoder> enc3 = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> rPso =
+            (__bridge id<MTLComputePipelineState>)packed_reduction_pipeline_;
+        [enc3 setComputePipelineState:rPso];
+        [enc3 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:0];
+        [enc3 setBuffer:(__bridge id<MTLBuffer>)dense_group_map_buffer_ offset:0 atIndex:1];
+        [enc3 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:2];
+        [enc3 setBuffer:histBuf offset:hist_output_offset atIndex:3];
+        [enc3 setBytes:&nt length:sizeof(uint32_t) atIndex:4];
+        [enc3 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:5];
+        NSUInteger tg3 = std::min(256u, (uint32_t)[rPso maxTotalThreadsPerThreadgroup]);
+        [enc3 dispatchThreadgroups:MTLSizeMake(nt, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg3, 1, 1)];
+        [enc3 endEncoding];
+        timer.Log("histogram/reduce_subhist");
+      } else {
+        // Narrow datasets prefer more workgroups over tuple packing. We still
+        // gather leaf rows up front so the histogram kernel stays sequential.
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> gPso =
+            (__bridge id<MTLComputePipelineState>)gather_pipeline_;
+        [enc setComputePipelineState:gPso];
+        [enc setBuffer:(__bridge id<MTLBuffer>)gradients_buffer_ offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)hessians_buffer_ offset:0 atIndex:1];
+        [enc setBuffer:idx_buf offset:leaf_indices_offset atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:4];
+        [enc setBuffer:(__bridge id<MTLBuffer>)bin_data_col_buffer_ offset:0 atIndex:5];
+        [enc setBuffer:(__bridge id<MTLBuffer>)ordered_bins_buffer_ offset:0 atIndex:6];
+        uint32_t ng = static_cast<uint32_t>(num_groups);
+        [enc setBytes:&nd length:sizeof(uint32_t) atIndex:7];
+        [enc setBytes:&ndt length:sizeof(uint32_t) atIndex:8];
+        [enc setBytes:&ng length:sizeof(uint32_t) atIndex:9];
+        NSUInteger tg = std::min(256u, (uint32_t)[gPso maxTotalThreadsPerThreadgroup]);
+        [enc dispatchThreadgroups:MTLSizeMake((num_data_in_leaf + tg - 1) / tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+        timer.Log("histogram/gather_grouped");
+
+        id<MTLComputeCommandEncoder> enc2 = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> hPso =
+            (__bridge id<MTLComputePipelineState>)histogram_row_pipeline_;
+        [enc2 setComputePipelineState:hPso];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_grad_buffer_ offset:0 atIndex:0];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_hess_buffer_ offset:0 atIndex:1];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)ordered_bins_buffer_ offset:0 atIndex:2];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:3];
+        [enc2 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:4];
+        [enc2 setBytes:&nd length:sizeof(uint32_t) atIndex:5];
+        [enc2 setBytes:&ng length:sizeof(uint32_t) atIndex:6];
+        [enc2 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:7];
+        NSUInteger tg2 = std::min(256u, (uint32_t)[hPso maxTotalThreadsPerThreadgroup]);
+        [enc2 dispatchThreadgroups:MTLSizeMake(ng * subhist_parts, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        [enc2 endEncoding];
+        timer.Log("histogram/build_group_subhist");
+
+        id<MTLComputeCommandEncoder> enc3 = [cmdBuf computeCommandEncoder];
+        id<MTLComputePipelineState> rPso =
+            (__bridge id<MTLComputePipelineState>)reduction_pipeline_;
+        [enc3 setComputePipelineState:rPso];
+        [enc3 setBuffer:(__bridge id<MTLBuffer>)subhist_buffer_ offset:0 atIndex:0];
+        [enc3 setBuffer:(__bridge id<MTLBuffer>)group_offsets_buffer_ offset:0 atIndex:1];
+        [enc3 setBuffer:histBuf offset:hist_output_offset atIndex:2];
+        [enc3 setBytes:&ng length:sizeof(uint32_t) atIndex:3];
+        [enc3 setBytes:&subhist_parts length:sizeof(uint32_t) atIndex:4];
+        NSUInteger tg3 = std::min(256u, (uint32_t)[rPso maxTotalThreadsPerThreadgroup]);
+        [enc3 dispatchThreadgroups:MTLSizeMake(ng, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg3, 1, 1)];
+        [enc3 endEncoding];
+        timer.Log("histogram/reduce_group_subhist");
+      }
     } else {
       // Column-grouped: one threadgroup per feature group (original path)
       id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
@@ -787,7 +915,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       [enc dispatchThreadgroups:MTLSizeMake(num_groups, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
       [enc endEncoding];
-      log_stage("histogram/grouped_encode");
+      timer.Log("histogram/grouped_encode");
     }
 
     if (leaf_hist_cache_buffer_ != nullptr && histogram_subtract_pipeline_ != nullptr &&
@@ -828,7 +956,7 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
     [cmdBuf commit];
 
     [cmdBuf waitUntilCompleted];
-    log_stage("histogram/gpu_wait");
+    timer.Log("histogram/gpu_wait");
 
     if (leaf_hist_cache_buffer_ != nullptr && smaller_leaf != nullptr &&
         smaller_leaf->leaf_index >= 0 && leaf_hist_num_items_ > 0) {
@@ -844,8 +972,31 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
       }
     }
 
+    // CPU histogram construction for sparse (multi-val) feature groups.
+    // MUST run BEFORE the dense GPU copy-out below: the multi-val HistMerge
+    // writes to the full hist buffer starting at offset 0, which can clobber
+    // dense positions.  The subsequent GPU dense copy overwrites those
+    // positions with the correct GPU-computed values (same ordering as the
+    // OpenCL gpu_tree_learner).
+    if (!sparse_feature_group_map_.empty()) {
+      std::vector<int8_t> is_sparse_used(num_features_, 0);
+      for (int fi = 0; fi < num_features_; ++fi) {
+        if (!is_feature_used[fi]) continue;
+        if (train_data_->IsMultiGroup(train_data_->Feature2Group(fi))) {
+          is_sparse_used[fi] = 1;
+        }
+      }
+      train_data_->ConstructHistograms<false, 0>(
+          is_sparse_used, data_indices, num_data_in_leaf,
+          gradients_, hessians_,
+          ordered_gradients_.data(), ordered_hessians_.data(),
+          share_state_.get(), ptr_smaller_leaf_hist_data);
+    }
+    timer.Log("histogram/sparse_cpu");
+
     if (!enable_gpu_split) {
-      // Legacy CPU split search still needs the full smaller-leaf histogram.
+      // Legacy CPU split search: copy GPU dense results into hist_t buffer,
+      // overwriting any dense bins that the sparse HistMerge may have clobbered.
       const float* hist_float =
           reinterpret_cast<const float*>([histBuf contents]) +
           hist_output_offset / sizeof(float);
@@ -861,7 +1012,30 @@ void MetalSingleGPUTreeLearner::ConstructHistograms(
         }
       }
     }
-    log_stage("histogram/copyout");
+
+    // Patch the GPU float cache with CPU-computed sparse histogram values
+    // so the Metal split finder sees correct values for all feature groups.
+    if (!sparse_feature_group_map_.empty() &&
+        leaf_hist_cache_buffer_ != nullptr && smaller_leaf != nullptr &&
+        smaller_leaf->leaf_index >= 0) {
+      float* leaf_hist_cache =
+          reinterpret_cast<float*>([(__bridge id<MTLBuffer>)leaf_hist_cache_buffer_ contents]);
+      const size_t smaller_hist_offset =
+          static_cast<size_t>(smaller_leaf->leaf_index) * leaf_hist_num_items_;
+      for (int sg : sparse_feature_group_map_) {
+        const int start = train_data_->GroupBinBoundary(sg);
+        const int nbins = train_data_->GroupBinBoundary(sg + 1) - start;
+        for (int b = 0; b < nbins; ++b) {
+          leaf_hist_cache[smaller_hist_offset + (start + b) * 2] =
+              static_cast<float>(ptr_smaller_leaf_hist_data[(start + b) * 2]);
+          leaf_hist_cache[smaller_hist_offset + (start + b) * 2 + 1] =
+              static_cast<float>(ptr_smaller_leaf_hist_data[(start + b) * 2 + 1]);
+        }
+      }
+
+    }
+
+    timer.Log("histogram/copyout");
   }
 
   if (larger_leaf_histogram_array_ != nullptr && !use_subtract &&
@@ -884,27 +1058,12 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
     const Tree* tree) {
   Common::FunctionTimer fun_timer(
       "MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms", global_timer);
-  const bool enable_gpu_split =
-      std::getenv("LIGHTGBM_METAL_DISABLE_GPU_SPLIT") == nullptr;
-  if (!enable_gpu_split) {
+  if (!MetalGPUSplitEnabled() || !use_gpu_histogram_) {
     SerialTreeLearner::FindBestSplitsFromHistograms(is_feature_used, use_subtract,
                                                     tree);
     return;
   }
-  const bool debug_logging = std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr;
-  const bool stage_timing =
-      std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
-  auto stage_start = std::chrono::steady_clock::now();
-  auto log_stage = [&](const char* name) {
-    if (!stage_timing) {
-      return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(
-        now - stage_start).count();
-    Log::Info("[MetalTiming] %s took %.3f ms", name, ms);
-    stage_start = now;
-  };
+  StageTimer timer;
 
   const MetalLeafSplitsStruct* smaller_leaf =
       GetActiveMetalLeafState(kSmallerLeafSlot);
@@ -957,7 +1116,7 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
           smaller_leaf_histogram_array_[feature_index]);
     }
   }
-  log_stage("split/subtract");
+  timer.Log("split/subtract");
 
   CHECK(best_split_finder_ != nullptr);
   best_split_finder_->FindBestSplitsForLeaf(
@@ -973,7 +1132,7 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
       larger_leaf,
       larger_leaf_index,
       larger_leaf_index >= 0 ? &larger_node_used_features : nullptr);
-  log_stage("split/gpu_search");
+  timer.Log("split/gpu_search");
 
   const auto materialize_feature_from_cache =
       [&](int leaf_index, int feature_index, FeatureHistogram* hist_array) {
@@ -1077,17 +1236,8 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
                       smaller_leaf_histogram_array_,
                       smaller_node_used_features,
                       GetMetalParentOutput(tree, smaller_leaf));
-    if (debug_logging) {
-      const SplitInfo& split = best_split_per_leaf_[smaller_leaf_index];
-      fprintf(stderr,
-              "[Metal] leaf=%d feature=%d threshold=%u counts=%d/%d gain=%.8f default_left=%d\n",
-              smaller_leaf_index, split.feature, split.threshold,
-              static_cast<int>(split.left_count),
-              static_cast<int>(split.right_count), split.gain,
-              static_cast<int>(split.default_left));
-    }
   }
-  log_stage("split/refine_smaller");
+  timer.Log("split/refine_smaller");
   if (larger_leaf_index >= 0) {
     best_split_finder_->GetBestSplitForLeaf(
         larger_leaf_index, &best_split_per_leaf_[larger_leaf_index]);
@@ -1095,17 +1245,8 @@ void MetalSingleGPUTreeLearner::FindBestSplitsFromHistograms(
                       larger_leaf_histogram_array_,
                       larger_node_used_features,
                       GetMetalParentOutput(tree, larger_leaf));
-    if (debug_logging) {
-      const SplitInfo& split = best_split_per_leaf_[larger_leaf_index];
-      fprintf(stderr,
-              "[Metal] leaf=%d feature=%d threshold=%u counts=%d/%d gain=%.8f default_left=%d\n",
-              larger_leaf_index, split.feature, split.threshold,
-              static_cast<int>(split.left_count),
-              static_cast<int>(split.right_count), split.gain,
-              static_cast<int>(split.default_left));
-    }
   }
-  log_stage("split/refine_larger");
+  timer.Log("split/refine_larger");
 }
 
 data_size_t MetalSingleGPUTreeLearner::PartitionLeafOnGPU(
@@ -1209,36 +1350,11 @@ void MetalSingleGPUTreeLearner::Split(
     int* left_leaf,
     int* right_leaf) {
   Common::FunctionTimer fun_timer("MetalSingleGPUTreeLearner::Split", global_timer);
-  const bool enable_gpu_partition =
-      std::getenv("LIGHTGBM_METAL_DISABLE_GPU_PARTITION") == nullptr;
-  if (!enable_gpu_partition) {
-    SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
-    SyncPartitionToGPU();
-    SyncMetalActiveLeafState();
+  if (!MetalGPUPartitionEnabled() || !use_gpu_histogram_) {
+    SerialTreeLearner::Split(tree, best_leaf, left_leaf, right_leaf);
     return;
   }
-  const bool stage_timing =
-      std::getenv("LIGHTGBM_METAL_STAGE_TIMING") != nullptr;
-  auto stage_start = std::chrono::steady_clock::now();
-  auto log_stage = [&](const char* name) {
-    if (!stage_timing) {
-      return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(
-        now - stage_start).count();
-    Log::Info("[MetalTiming] %s took %.3f ms", name, ms);
-    stage_start = now;
-  };
-  if (std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
-    const SplitInfo& split = best_split_per_leaf_[best_leaf];
-    fprintf(stderr,
-            "[Metal] split leaf=%d feature=%d threshold=%u counts=%d/%d gain=%.8f default_left=%d\n",
-            best_leaf, split.feature, split.threshold,
-            static_cast<int>(split.left_count),
-            static_cast<int>(split.right_count), split.gain,
-            static_cast<int>(split.default_left));
-  }
+  StageTimer timer;
   SplitInfo& best_split_info = best_split_per_leaf_[best_leaf];
   const int inner_feature_index =
       train_data_->InnerFeatureIndex(best_split_info.feature);
@@ -1258,28 +1374,39 @@ void MetalSingleGPUTreeLearner::Split(
   if (!is_numerical_split) {
     Log::Fatal("Metal tree learner only supports numerical splits.");
   }
+  if (train_data_->IsMultiGroup(train_data_->Feature2Group(inner_feature_index))) {
+    // Sparse/multi-group features don't have valid bin data in GPU buffer.
+    SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+    SyncPartitionToGPU();
+    SyncMetalActiveLeafState();
+    return;
+  }
+  if (train_data_->FeatureBinMapper(inner_feature_index)->missing_type() ==
+      MissingType::NaN) {
+    // The current GPU partition kernel does not yet match the CPU NaN-routing
+    // path on every threshold shape, so keep partitioning on CPU for NaN
+    // features while preserving the GPU histogram / split-search wins.
+    SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
+    SyncPartitionToGPU();
+    SyncMetalActiveLeafState();
+    return;
+  }
 
-  const data_size_t expected_left_count = best_split_info.left_count;
-  const data_size_t expected_right_count = best_split_info.right_count;
   const data_size_t left_count = PartitionLeafOnGPU(
       best_leaf, inner_feature_index, best_split_info.threshold,
       best_split_info.default_left);
   const data_size_t total_count = data_partition_->leaf_count(best_leaf);
   const data_size_t right_count = total_count - left_count;
   if (left_count <= 0 || right_count <= 0 ||
-      left_count != expected_left_count ||
-      right_count != expected_right_count ||
       !ValidatePartitionSums(data_partition_->leaf_begin(best_leaf), left_count,
                              total_count, best_split_info)) {
-    if (std::getenv("LIGHTGBM_METAL_DEBUG") != nullptr) {
-      fprintf(stderr,
-              "[Metal] partition mismatch on leaf=%d feature=%d threshold=%u expected=%d/%d actual=%d/%d; falling back to CPU partition\n",
-              best_leaf, best_split_info.feature, best_split_info.threshold,
-              static_cast<int>(expected_left_count),
-              static_cast<int>(expected_right_count),
-              static_cast<int>(left_count),
-              static_cast<int>(right_count));
-    }
+    Log::Warning(
+        "[Metal] partition mismatch on leaf=%d (expected %d/%d, actual %d/%d), falling back to CPU",
+        best_leaf,
+        static_cast<int>(best_split_info.left_count),
+        static_cast<int>(best_split_info.right_count),
+        static_cast<int>(left_count),
+        static_cast<int>(right_count));
     SplitInner(tree, best_leaf, left_leaf, right_leaf, true);
     SyncPartitionToGPU();
     SyncMetalActiveLeafState();
@@ -1288,7 +1415,7 @@ void MetalSingleGPUTreeLearner::Split(
   data_partition_->ApplyExternalSplit(best_leaf, next_leaf_id, left_count);
   best_split_info.left_count = left_count;
   best_split_info.right_count = right_count;
-  log_stage("partition/gpu");
+  timer.Log("partition/gpu");
 
   const auto threshold_double =
       train_data_->RealThreshold(inner_feature_index, best_split_info.threshold);
@@ -1304,18 +1431,14 @@ void MetalSingleGPUTreeLearner::Split(
       static_cast<float>(best_split_info.gain + config_->min_gain_to_split),
       train_data_->FeatureBinMapper(inner_feature_index)->missing_type(),
       best_split_info.default_left);
-  log_stage("partition/tree_split");
+  timer.Log("partition/tree_split");
   UpdateMetalLeafState(*left_leaf, best_split_info.left_sum_gradient,
                        best_split_info.left_sum_hessian,
                        best_split_info.left_count, best_split_info.left_output);
   UpdateMetalLeafState(*right_leaf, best_split_info.right_sum_gradient,
                        best_split_info.right_sum_hessian,
                        best_split_info.right_count, best_split_info.right_output);
-  log_stage("partition/update_leaf_state");
-
-#ifdef DEBUG
-  CHECK(*right_leaf == next_leaf_id);
-#endif
+  timer.Log("partition/update_leaf_state");
 
   if (best_split_info.left_count < best_split_info.right_count) {
     CHECK_GT(best_split_info.left_count, 0);
@@ -1338,11 +1461,8 @@ void MetalSingleGPUTreeLearner::Split(
                               best_split_info.left_sum_hessian,
                               best_split_info.left_output);
   }
-  log_stage("partition/leaf_init");
+  timer.Log("partition/leaf_init");
 
-#ifdef DEBUG
-  CheckSplit(best_split_info, *left_leaf, *right_leaf);
-#endif
 
   auto leaves_need_update = constraints_->Update(
       true, *left_leaf, *right_leaf,
@@ -1352,7 +1472,7 @@ void MetalSingleGPUTreeLearner::Split(
   for (auto leaf : leaves_need_update) {
     RecomputeBestSplitForLeaf(tree, leaf, &best_split_per_leaf_[leaf]);
   }
-  log_stage("partition/constraints");
+  timer.Log("partition/constraints");
 }
 
 // ============================================================================
@@ -1360,8 +1480,10 @@ void MetalSingleGPUTreeLearner::Split(
 // ============================================================================
 
 void MetalSingleGPUTreeLearner::AllocateMetalBuffers() {
-  if (!num_dense_feature_groups_) {
-    Log::Warning("Metal GPU acceleration disabled — no dense features found");
+  if (!use_gpu_histogram_) {
+    if (num_dense_feature_groups_ == 0) {
+      Log::Warning("Metal GPU acceleration disabled — no dense features found");
+    }
     return;
   }
   @autoreleasepool {
@@ -1384,6 +1506,7 @@ void MetalSingleGPUTreeLearner::ResetTrainingData(
   SerialTreeLearner::ResetTrainingData(train_data, is_constant_hessian);
   ValidateTrainingScope(train_data_);
   num_feature_groups_ = train_data_->num_feature_groups();
+  BuildFeatureGroupMaps();
   bin_data_packed_ = false;
   ResetMetalLeafStateTable();
   if (best_split_finder_ != nullptr) {

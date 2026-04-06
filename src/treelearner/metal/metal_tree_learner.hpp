@@ -31,11 +31,19 @@ struct MetalLeafSplitsStruct;
  * split-search path until the experimental Metal split finder / partitioner
  * are fast enough to help end-to-end wall time.
  *
- * Two kernel strategies, auto-selected based on feature count:
- *  - Row-parallel (wide datasets): one thread per row, all features per thread.
- *    Reads each gradient once instead of N_features times.
- *  - Column-grouped (narrow datasets): one threadgroup per feature group,
- *    fast threadgroup-local histogram with CAS-loop atomics.
+ * Histogram construction uses gathered row-parallel kernels that first reorder
+ * leaf rows into sequential order, then build histograms without re-reading
+ * gradients through random indirection.
+ *
+ * Two gathered variants are used:
+ *  - Narrow datasets: one workgroup per dense feature group for higher
+ *    parallelism.
+ *  - Wide datasets: pack four dense groups into each workgroup to reuse the
+ *    gathered gradients / Hessians across more features.
+ *
+ * The legacy ungathered column-grouped kernel is still kept as an
+ * implementation fallback, but dense numerical training should normally stay
+ * on one of the gathered paths.
  */
 class MetalSingleGPUTreeLearner : public SerialTreeLearner {
  public:
@@ -63,6 +71,8 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   /*! \brief Initialize Metal device, load metallib, create pipeline */
   void InitMetal();
   void ValidateTrainingScope(const Dataset* train_data) const;
+  /*! \brief Build dense_feature_group_indices_ and sparse_feature_group_map_ */
+  void BuildFeatureGroupMaps();
 
   /*! \brief Allocate Metal buffers for gradient/hessian/indices */
   void AllocateMetalBuffers();
@@ -118,7 +128,9 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   void* dense_group_map_buffer_ = nullptr;  // [tuples × 4] dense group ids
   void* group_offsets_buffer_ = nullptr;
   bool bin_data_packed_ = false;
-  bool use_row_parallel_ = false;         // auto-selected based on feature count
+  bool use_gpu_histogram_ = true;         // false → delegate to SerialTreeLearner
+  bool use_row_parallel_ = false;         // packed gather / row-parallel path
+  bool use_packed_histogram_ = true;      // pack 4 dense groups per workgroup
   std::vector<uint32_t> group_bin_offsets_;
   std::vector<uint32_t> dense_group_map_;
   std::unique_ptr<MetalBestSplitFinder> best_split_finder_;
@@ -129,6 +141,8 @@ class MetalSingleGPUTreeLearner : public SerialTreeLearner {
   int num_dense_feature_groups_;
   int num_dense_feature_tuples_ = 0;
   int max_num_bin_;
+  std::vector<int> dense_feature_group_indices_;  // maps dense-sequential index → actual group id
+  std::vector<int> sparse_feature_group_map_;     // actual group ids of multi-val/sparse groups
   size_t leaf_hist_num_items_ = 0;
 
   data_size_t PartitionLeafOnGPU(int leaf, int inner_feature_index,

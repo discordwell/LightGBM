@@ -474,7 +474,6 @@ set(
 if(LGBM_USE_METAL)
     set(LGBM_METAL_SOURCES
         src/treelearner/metal/metal_best_split_finder.mm
-        src/treelearner/metal/metal_histogram_constructor.mm
         src/treelearner/metal/metal_leaf_splits.mm
         src/treelearner/metal/metal_tree_learner.mm
         src/treelearner/metal/metal_utils.mm
